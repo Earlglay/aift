@@ -13,20 +13,4 @@ app.get('/', (req, res) => {
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
-});        try {
-          $(el).attr('src', new URL(src, targetUrl).href);
-        } catch (e) { /* 무시 */ }
-      }
-    });
-
-    // 결과를 브라우저에 뿌려주기
-    res.send($.html());
-
-  } catch (error) {
-    res.status(500).send(`사이트에 접속할 수 없습니다: ${error.message}`);
-  }
-});
-
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
 });
