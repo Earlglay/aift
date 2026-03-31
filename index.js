@@ -2,9 +2,15 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const port = process.env.PORT || 3000;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -24,7 +30,7 @@ app.get('/proxy', async (req, res) => {
 
     const $ = cheerio.load(response.data);
 
-    // 이미지 경로 수정
+    // 1. 이미지 경로 수정
     $('img').each((i, el) => {
       const src = $(el).attr('src');
       if (src && !src.startsWith('http')) {
@@ -32,7 +38,7 @@ app.get('/proxy', async (req, res) => {
       }
     });
 
-    // 링크(a) 경로 수정 - 클릭 시 프록시 유지
+    // 2. 링크(a) 경로 수정
     $('a').each((i, el) => {
       const href = $(el).attr('href');
       if (href && !href.startsWith('#') && !href.startsWith('javascript')) {
@@ -43,13 +49,16 @@ app.get('/proxy', async (req, res) => {
       }
     });
 
-    // 스타일시트 경로 수정
+    // 3. 스타일시트 경로 수정
     $('link[rel="stylesheet"]').each((i, el) => {
       const href = $(el).attr('href');
       if (href && !href.startsWith('http')) {
         try { $(el).attr('href', new URL(href, targetUrl).href); } catch (e) {}
       }
     });
+
+    // 4. DB에 방문 기록 저장 (비동기로 실행하여 응답 속도 유지)
+    pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch(err => console.error('DB 저장 실패:', err));
 
     res.send($.html());
   } catch (error) {
