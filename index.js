@@ -7,9 +7,10 @@ const { Pool } = require('pg');
 const app = express();
 const port = process.env.PORT || 3000;
 
+// DB 연결 (Render 환경 변수 DATABASE_URL 사용)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -31,23 +32,23 @@ app.get('/proxy', async (req, res) => {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
       },
-      responseType: 'arraybuffer', // [핵심] 바이너리 데이터 손상 방지
+      responseType: 'arraybuffer',
       timeout: 15000,
-      validateStatus: false // 404 등 에러 페이지도 일단 받아오도록 설정
+      validateStatus: false
     });
 
     const contentType = response.headers['content-type'] || '';
     res.set('Content-Type', contentType);
 
-    // HTML인 경우에만 내용을 파싱하고 수정
+    // [1] HTML인 경우: 태그들의 경로를 우리 프록시 주소로 치환
     if (contentType.includes('text/html')) {
-      const html = response.data.toString('utf-8');
+      let html = response.data.toString('utf-8');
       const $ = cheerio.load(html);
 
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
-          if (val && !val.startsWith('data:')) {
+          if (val && !val.startsWith('data:') && !val.startsWith('javascript:')) {
             try {
               const absolute = new URL(val, targetUrl).href;
               $(el).attr(attr, `/proxy?url=${encodeURIComponent(absolute)}`);
@@ -57,11 +58,13 @@ app.get('/proxy', async (req, res) => {
       };
 
       rewrite('img', 'src');
-      rewrite('img', 'srcset'); // [추가] srcset 대응
+      rewrite('img', 'srcset');
       rewrite('link', 'href');
       rewrite('script', 'src');
       rewrite('source', 'src');
       rewrite('source', 'srcset');
+      rewrite('video', 'src');
+      rewrite('audio', 'src');
 
       $('a').each((i, el) => {
         const href = $(el).attr('href');
@@ -85,13 +88,26 @@ app.get('/proxy', async (req, res) => {
         } catch (e) {}
       });
 
-      // 기록 저장
+      // 방문 기록 저장 (오류나도 무시)
       pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch(() => {});
 
       return res.send($.html());
     }
 
-    // HTML이 아닌 경우 (이미지, CSS, JS 등)는 원본 그대로 전송
+    // [2] CSS인 경우: url() 안의 경로들을 프록시로 치환 (배경 이미지 해결)
+    if (contentType.includes('text/css')) {
+      let css = response.data.toString('utf-8');
+      css = css.replace(/url\(['"]?([^'")]*)['"]?\)/g, (match, p1) => {
+        try {
+          if (p1.startsWith('data:')) return match;
+          const absolute = new URL(p1, targetUrl).href;
+          return `url("/proxy?url=${encodeURIComponent(absolute)}")`;
+        } catch (e) { return match; }
+      });
+      return res.send(css);
+    }
+
+    // [3] 그 외(이미지, 폰트 등): 원본 바이너리 그대로 전송
     res.send(response.data);
 
   } catch (error) {
@@ -99,4 +115,4 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-app.listen(port, () => { console.log(`Server running on ${port}`); });
+app.listen(port, () => { console.log(`Proxy server running on port ${port}`); });
