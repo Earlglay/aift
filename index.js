@@ -8,10 +8,16 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 // DB 연결 (Render 환경 변수 DATABASE_URL 사용)
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
-});
+let pool;
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+  });
+  console.log('Database URL detected. History will be saved.');
+} else {
+  console.log('No DATABASE_URL found. History feature is disabled.');
+}
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -20,17 +26,27 @@ app.get('/', (req, res) => {
 });
 
 app.get('/proxy', async (req, res) => {
-  const targetUrl = req.query.url;
+  let targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('URL이 필요합니다.');
 
   try {
+    // [추가] 검색어 등 추가 파라미터 처리 (예: ?url=...&q=test -> ...&q=test)
+    const urlObj = new URL(targetUrl);
+    Object.keys(req.query).forEach(key => {
+      if (key !== 'url') {
+        urlObj.searchParams.set(key, req.query[key]);
+      }
+    });
+    targetUrl = urlObj.toString();
+
     const userAgent = req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
     const response = await axios.get(targetUrl, {
       headers: { 
         'User-Agent': userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': new URL(targetUrl).origin // [추가] 보안 및 필터링 우회용
       },
       responseType: 'arraybuffer',
       timeout: 15000,
@@ -88,8 +104,12 @@ app.get('/proxy', async (req, res) => {
         } catch (e) {}
       });
 
-      // 방문 기록 저장 (오류나도 무시)
-      pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch(() => {});
+      // 방문 기록 저장 (Pool이 있을 때만 실행)
+      if (pool) {
+        pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch((err) => {
+            console.error('History save error:', err.message);
+        });
+      }
 
       return res.send($.html());
     }
