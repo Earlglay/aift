@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// [1] DB 연결 설정 (Neon DB)
+// [1] DB 연결 설정 (Render 환경 변수 사용)
 let pool;
 if (process.env.DATABASE_URL) {
   pool = new Pool({
@@ -22,19 +22,23 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// [2] 핵심 프록시 엔진: /proxy 경로 처리
+// [2] 핵심 프록시 엔진
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // Bing/Google 검색 시 발생하는 /search 경로 이탈 방지 로직
-  if (!targetUrl && req.query.q) {
-    const engine = req.headers.referer && req.headers.referer.includes('google') ? 'google.com' : 'bing.com';
-    targetUrl = `https://www.${engine}/search?q=${encodeURIComponent(req.query.q)}`;
+  // [검색 엔진 예외 처리] url 없이 검색어(q, query)만 들어온 경우 대응
+  if (!targetUrl) {
+    if (req.query.query) { // 네이버 방식
+      targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(req.query.query)}`;
+    } else if (req.query.q) { // 구글/빙 방식
+      targetUrl = `https://www.bing.com/search?q=${encodeURIComponent(req.query.q)}`;
+    }
   }
 
   if (!targetUrl) return res.status(400).send('URL이 필요합니다.');
 
   try {
+    // 현재 접속한 기기(태블릿/모바일)의 User-Agent를 그대로 전달하여 레이아웃 최적화
     const userAgent = req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
     const response = await axios.get(targetUrl, {
@@ -44,7 +48,7 @@ app.get('/proxy', async (req, res) => {
         'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
         'Referer': new URL(targetUrl).origin 
       },
-      responseType: 'arraybuffer',
+      responseType: 'arraybuffer', // 모든 데이터를 바이너리로 받아 깨짐 방지
       timeout: 15000,
       validateStatus: false
     });
@@ -52,11 +56,12 @@ app.get('/proxy', async (req, res) => {
     const contentType = response.headers['content-type'] || '';
     res.set('Content-Type', contentType);
 
-    // HTML 처리 (경로 치환 및 폼 가로채기)
+    // [HTML 처리]
     if (contentType.includes('text/html')) {
       let html = response.data.toString('utf-8');
       const $ = cheerio.load(html);
 
+      // 리소스 경로 치환 (이미지, 스크립트 등)
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -70,6 +75,7 @@ app.get('/proxy', async (req, res) => {
       };
 
       rewrite('img', 'src');
+      rewrite('img', 'srcset');
       rewrite('link', 'href');
       rewrite('script', 'src');
       rewrite('source', 'src');
@@ -85,13 +91,15 @@ app.get('/proxy', async (req, res) => {
         }
       });
 
-      // 폼(검색창) 전송 경로를 무조건 /proxy로 고정
+      // 폼(검색창) 가로채기 보강
       $('form').each((i, el) => {
         const action = $(el).attr('action') || '';
         try {
           const absoluteAction = new URL(action, targetUrl).href;
           $(el).attr('action', '/proxy'); 
           $(el).attr('method', 'GET');
+          
+          // 목적지 URL을 숨겨진 input으로 삽입
           if ($(el).find('input[name="url"]').length === 0) {
             $(el).prepend(`<input type="hidden" name="url" value="${absoluteAction}">`);
           }
@@ -105,7 +113,7 @@ app.get('/proxy', async (req, res) => {
       return res.send($.html());
     }
 
-    // CSS 내부 경로(배경 이미지 등) 처리
+    // [CSS 처리] 배경 이미지 경로 치환
     if (contentType.includes('text/css')) {
       let css = response.data.toString('utf-8');
       css = css.replace(/url\(['"]?([^'")]*)['"]?\)/g, (match, p1) => {
@@ -118,6 +126,7 @@ app.get('/proxy', async (req, res) => {
       return res.send(css);
     }
 
+    // 그 외 리소스(이미지 등)는 그대로 전송
     res.send(response.data);
 
   } catch (error) {
@@ -125,12 +134,13 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// [3] 예외 처리: 사이트가 강제로 /search로 보낼 경우를 대비한 별도 경로 설정
+// [3] 경로 이탈 대응 (네이버/빙/구글의 /search 요청 수신)
 app.get('/search', (req, res) => {
-  // 사용자가 우리 서버의 /search로 튕겨져 들어오면, 검색어(q)를 낚아채서 /proxy로 리다이렉트
-  const query = req.query.q;
+  const query = req.query.query || req.query.q; // query(네이버) 또는 q(구글/빙) 확인
   if (query) {
-    res.redirect(`/proxy?q=${encodeURIComponent(query)}`);
+    // 검색어가 있다면 적절한 파라미터명과 함께 /proxy로 보냄
+    const paramName = req.query.query ? 'query' : 'q';
+    res.redirect(`/proxy?${paramName}=${encodeURIComponent(query)}`);
   } else {
     res.redirect('/');
   }
