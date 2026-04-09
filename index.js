@@ -7,16 +7,13 @@ const { Pool } = require('pg');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// DB 연결 (Render 환경 변수 DATABASE_URL 사용)
+// [1] DB 연결 설정 (Neon DB)
 let pool;
 if (process.env.DATABASE_URL) {
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
   });
-  console.log('Database URL detected. History will be saved.');
-} else {
-  console.log('No DATABASE_URL found. History feature is disabled.');
 }
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -25,20 +22,19 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// [2] 핵심 프록시 엔진: /proxy 경로 처리
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
+
+  // Bing/Google 검색 시 발생하는 /search 경로 이탈 방지 로직
+  if (!targetUrl && req.query.q) {
+    const engine = req.headers.referer && req.headers.referer.includes('google') ? 'google.com' : 'bing.com';
+    targetUrl = `https://www.${engine}/search?q=${encodeURIComponent(req.query.q)}`;
+  }
+
   if (!targetUrl) return res.status(400).send('URL이 필요합니다.');
 
   try {
-    // [추가] 검색어 등 추가 파라미터 처리 (예: ?url=...&q=test -> ...&q=test)
-    const urlObj = new URL(targetUrl);
-    Object.keys(req.query).forEach(key => {
-      if (key !== 'url') {
-        urlObj.searchParams.set(key, req.query[key]);
-      }
-    });
-    targetUrl = urlObj.toString();
-
     const userAgent = req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
 
     const response = await axios.get(targetUrl, {
@@ -46,7 +42,7 @@ app.get('/proxy', async (req, res) => {
         'User-Agent': userAgent,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Referer': new URL(targetUrl).origin // [추가] 보안 및 필터링 우회용
+        'Referer': new URL(targetUrl).origin 
       },
       responseType: 'arraybuffer',
       timeout: 15000,
@@ -56,7 +52,7 @@ app.get('/proxy', async (req, res) => {
     const contentType = response.headers['content-type'] || '';
     res.set('Content-Type', contentType);
 
-    // [1] HTML인 경우: 태그들의 경로를 우리 프록시 주소로 치환
+    // HTML 처리 (경로 치환 및 폼 가로채기)
     if (contentType.includes('text/html')) {
       let html = response.data.toString('utf-8');
       const $ = cheerio.load(html);
@@ -74,14 +70,11 @@ app.get('/proxy', async (req, res) => {
       };
 
       rewrite('img', 'src');
-      rewrite('img', 'srcset');
       rewrite('link', 'href');
       rewrite('script', 'src');
       rewrite('source', 'src');
-      rewrite('source', 'srcset');
-      rewrite('video', 'src');
-      rewrite('audio', 'src');
 
+      // 링크 클릭 시 프록시 유지
       $('a').each((i, el) => {
         const href = $(el).attr('href');
         if (href && !href.startsWith('#') && !href.startsWith('javascript')) {
@@ -92,11 +85,12 @@ app.get('/proxy', async (req, res) => {
         }
       });
 
+      // 폼(검색창) 전송 경로를 무조건 /proxy로 고정
       $('form').each((i, el) => {
         const action = $(el).attr('action') || '';
         try {
           const absoluteAction = new URL(action, targetUrl).href;
-          $(el).attr('action', '/proxy');
+          $(el).attr('action', '/proxy'); 
           $(el).attr('method', 'GET');
           if ($(el).find('input[name="url"]').length === 0) {
             $(el).prepend(`<input type="hidden" name="url" value="${absoluteAction}">`);
@@ -104,17 +98,14 @@ app.get('/proxy', async (req, res) => {
         } catch (e) {}
       });
 
-      // 방문 기록 저장 (Pool이 있을 때만 실행)
       if (pool) {
-        pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch((err) => {
-            console.error('History save error:', err.message);
-        });
+        pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch(() => {});
       }
 
       return res.send($.html());
     }
 
-    // [2] CSS인 경우: url() 안의 경로들을 프록시로 치환 (배경 이미지 해결)
+    // CSS 내부 경로(배경 이미지 등) 처리
     if (contentType.includes('text/css')) {
       let css = response.data.toString('utf-8');
       css = css.replace(/url\(['"]?([^'")]*)['"]?\)/g, (match, p1) => {
@@ -127,11 +118,21 @@ app.get('/proxy', async (req, res) => {
       return res.send(css);
     }
 
-    // [3] 그 외(이미지, 폰트 등): 원본 바이너리 그대로 전송
     res.send(response.data);
 
   } catch (error) {
     res.status(500).send(`접속 오류: ${error.message}`);
+  }
+});
+
+// [3] 예외 처리: 사이트가 강제로 /search로 보낼 경우를 대비한 별도 경로 설정
+app.get('/search', (req, res) => {
+  // 사용자가 우리 서버의 /search로 튕겨져 들어오면, 검색어(q)를 낚아채서 /proxy로 리다이렉트
+  const query = req.query.q;
+  if (query) {
+    res.redirect(`/proxy?q=${encodeURIComponent(query)}`);
+  } else {
+    res.redirect('/');
   }
 });
 
