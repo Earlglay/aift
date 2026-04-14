@@ -26,7 +26,7 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // 검색어 파라미터(q, query 등)를 타겟 URL에 합치는 과정
+  // 파라미터 병합 (검색어 등 유지)
   if (targetUrl) {
     try {
       const urlObj = new URL(targetUrl);
@@ -37,7 +37,7 @@ app.get('/proxy', async (req, res) => {
       });
       targetUrl = urlObj.href;
     } catch (e) {
-      console.error("URL 생성 오류:", e);
+      console.error("URL 생성 실패:", e);
     }
   }
 
@@ -70,7 +70,7 @@ app.get('/proxy', async (req, res) => {
           if (val && !val.startsWith('data:') && !val.startsWith('javascript:')) {
             try {
               const absolute = new URL(val, targetUrl).href;
-              $(el).attr(attr, `/proxy?url=${encodeURIComponent(absolute)}`);
+              $(el).attr(attr, '/proxy?url=' + encodeURIComponent(absolute));
             } catch (e) {}
           }
         });
@@ -89,7 +89,7 @@ app.get('/proxy', async (req, res) => {
           $(el).attr('action', '/proxy');
           $(el).attr('method', 'GET');
           if ($(el).find('input[name="url"]').length === 0) {
-            $(el).prepend(`<input type="hidden" name="url" value="${absoluteAction}">`);
+            $(el).prepend('<input type="hidden" name="url" value="' + absoluteAction + '">');
           }
         } catch (e) {}
       });
@@ -108,7 +108,7 @@ app.get('/proxy', async (req, res) => {
         try {
           if (p1.startsWith('data:')) return match;
           const absolute = new URL(p1, targetUrl).href;
-          return `url("/proxy?url=${encodeURIComponent(absolute)}")`;
+          return 'url("/proxy?url=' + encodeURIComponent(absolute) + '")';
         } catch (e) { return match; }
       });
       return res.send(css);
@@ -117,20 +117,38 @@ app.get('/proxy', async (req, res) => {
     res.send(response.data);
 
   } catch (error) {
-    res.status(500).send(`접속 오류: ${error.message}`);
+    res.status(500).send('Proxy Error: ' + error.message);
   }
 });
 
-// [3] 경로 이탈 및 네이버 클릭 추적 대응 (와일드카드)
+// [3] 경로 이탈 및 추적 경로 자동 복원 (와일드카드)
 app.get('*', (req, res) => {
-  // 예약된 경로는 통과
-  if (req.path === '/proxy' || req.path === '/search' || req.path === '/') return;
+  const path = req.path;
+  if (path === '/proxy' || path === '/search' || path === '/') return;
 
-  // 알 수 없는 경로는 네이버의 상대 경로일 확률이 높으므로 네이버 도메인을 붙여 프록시로 보냄
-  const originDomain = 'https://www.naver.com';
-  const fullUrl = originDomain + req.originalUrl;
-  
-  res.redirect(`/proxy?url=${encodeURIComponent(fullUrl)}`);
+  // (1) 네이버 전용 추적 경로 가로채기
+  if (path.includes('/p/crd/rd')) {
+    const fullUrl = 'https://www.naver.com' + req.originalUrl;
+    return res.redirect('/proxy?url=' + encodeURIComponent(fullUrl));
+  }
+
+  // (2) Referer를 활용한 상대 경로 도메인 추론
+  const referer = req.headers.referer;
+  if (referer && referer.includes('/proxy?url=')) {
+    try {
+      const refUrl = new URL(referer);
+      const originalReferer = refUrl.searchParams.get('url');
+      if (originalReferer) {
+        const lastBase = new URL(originalReferer).origin;
+        const recoveredUrl = lastBase + req.originalUrl;
+        console.log('경로 복원 성공:', recoveredUrl);
+        return res.redirect('/proxy?url=' + encodeURIComponent(recoveredUrl));
+      }
+    } catch (e) {}
+  }
+
+  // (3) 근거가 없으면 홈으로 이동 (무한 루프 방지)
+  res.redirect('/');
 });
 
-app.listen(port, () => { console.log(`Proxy running on ${port}`); });
+app.listen(port, () => { console.log('Server running on ' + port); });
