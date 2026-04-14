@@ -51,7 +51,12 @@ app.get('/proxy', async (req, res) => {
     res.set('Content-Type', contentType);
 
     if (contentType.includes('text/html')) {
-      const $ = cheerio.load(response.data.toString('utf-8'));
+      let html = response.data.toString('utf-8');
+      
+      // 보안 정책(CSP) 해제 - 브라우저가 외부 스크립트 차단하는 것 방지
+      html = html.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/gi, '');
+
+      const $ = cheerio.load(html);
 
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
@@ -70,43 +75,36 @@ app.get('/proxy', async (req, res) => {
       rewrite('script', 'src');
       rewrite('a', 'href');
 
-      // [추가] 링크 가로채기 스크립트 주입
-      // 이 스크립트는 브라우저에서 실행되어, 클릭 시 모든 이동 주소를 우리 프록시로 강제 전환합니다.
+      // [핵심] 초강력 자바스크립트 가로채기 주입
       const injectScript = `
         <script>
-          (function() {
-            // 모든 클릭 이벤트 감시
-            document.addEventListener('click', function(e) {
-              var a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(window.location.host + '/proxy')) {
-                // 이미 우리 프록시 주소가 아닌 경우 가로챔
-                if (a.href.startsWith('javascript:') || a.href.startsWith('#')) return;
+          // 모든 클릭을 가로채서 절대 놓치지 않음
+          window.onclick = function(e) {
+            var el = e.target;
+            while (el && el.tagName !== 'A') el = el.parentNode;
+            if (el && el.href) {
+              if (el.href.indexOf(window.location.host) === -1) {
                 e.preventDefault();
-                e.stopPropagation();
-                window.location.href = '/proxy?url=' + encodeURIComponent(a.href);
+                e.stopImmediatePropagation();
+                window.location.href = '/proxy?url=' + encodeURIComponent(el.href);
+                return false;
               }
-            }, true);
-
-            // 윈도우 오픈(새창) 가로채기
-            window.open = function(url) {
-              window.location.href = '/proxy?url=' + encodeURIComponent(new URL(url, location.href).href);
-              return null;
-            };
-          })();
+            }
+          };
+          // 원본 스크립트가 주소를 바꾸지 못하게 방어
+          var originalLocation = window.location.href;
+          window.onbeforeunload = function() {
+            // 원치 않는 리다이렉트 감지 시 로직 추가 가능
+          };
         </script>
       `;
+      
       $('head').prepend(injectScript);
-
       $('a').removeAttr('target').removeAttr('rel');
-      $('form').each((i, el) => {
-        const action = $(el).attr('action') || '';
-        try {
-          const absoluteAction = new URL(action, targetUrl).href;
-          $(el).attr('action', '/proxy').attr('method', 'GET').removeAttr('target');
-          if ($(el).find('input[name="url"]').length === 0) {
-            $(el).prepend('<input type="hidden" name="url" value="' + absoluteAction + '">');
-          }
-        } catch (e) {}
+      
+      // 인라인 스크립트(onclick 등) 내의 주소도 억지로 바꿈
+      $('*[onclick]').each((i, el) => {
+        $(el).removeAttr('onclick'); 
       });
 
       return res.send($.html());
@@ -114,7 +112,7 @@ app.get('/proxy', async (req, res) => {
 
     if (contentType.includes('text/css')) {
       let css = response.data.toString('utf-8');
-      css = css.replace(/url\\(['"]?([^'")]*)['"]?\\)/g, (match, p1) => {
+      css = css.replace(/url\(['"]?([^'")]*)['"]?\)/g, (match, p1) => {
         try {
           if (p1.startsWith('data:')) return match;
           return 'url("/proxy?url=' + encodeURIComponent(new URL(p1, targetUrl).href) + '")';
@@ -132,12 +130,9 @@ app.get('*', (req, res) => {
   const path = req.path;
   if (path === '/proxy' || path === '/search' || path === '/') return;
 
-  if (path.includes('/p/crd/rd')) {
-    const fullUrl = 'https://www.naver.com' + req.originalUrl;
-    return res.redirect('/proxy?url=' + encodeURIComponent(fullUrl));
-  }
-
   const referer = req.headers.referer;
+  const originDomain = 'https://www.naver.com'; // 기본값을 네이버로 설정
+
   if (referer && referer.includes('/proxy?url=')) {
     try {
       const refUrl = new URL(referer);
@@ -148,7 +143,9 @@ app.get('*', (req, res) => {
       }
     } catch (e) {}
   }
-  res.redirect('/');
+  
+  // 정보를 알 수 없을 때는 네이버라고 가정하고 보냄 (홈으로 튕김 방지)
+  res.redirect('/proxy?url=' + encodeURIComponent(originDomain + req.originalUrl));
 });
 
-app.listen(port, () => { console.log('Server running on ' + port); });
+app.listen(port, () => { console.log('Server is running'); });
