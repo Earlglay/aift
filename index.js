@@ -70,32 +70,51 @@ app.get('/proxy', async (req, res) => {
       rewrite('script', 'src');
       rewrite('a', 'href');
 
-      // [핵심 추가] 새 창 열기 방지 및 보안 속성 해제
-      $('a').each((i, el) => {
-        $(el).removeAttr('target'); // target="_blank" 제거
-        $(el).removeAttr('rel');    // noreferrer 등으로 주소 숨기는 것 방지
-      });
+      // [추가] 링크 가로채기 스크립트 주입
+      // 이 스크립트는 브라우저에서 실행되어, 클릭 시 모든 이동 주소를 우리 프록시로 강제 전환합니다.
+      const injectScript = `
+        <script>
+          (function() {
+            // 모든 클릭 이벤트 감시
+            document.addEventListener('click', function(e) {
+              var a = e.target.closest('a');
+              if (a && a.href && !a.href.includes(window.location.host + '/proxy')) {
+                // 이미 우리 프록시 주소가 아닌 경우 가로챔
+                if (a.href.startsWith('javascript:') || a.href.startsWith('#')) return;
+                e.preventDefault();
+                e.stopPropagation();
+                window.location.href = '/proxy?url=' + encodeURIComponent(a.href);
+              }
+            }, true);
 
+            // 윈도우 오픈(새창) 가로채기
+            window.open = function(url) {
+              window.location.href = '/proxy?url=' + encodeURIComponent(new URL(url, location.href).href);
+              return null;
+            };
+          })();
+        </script>
+      `;
+      $('head').prepend(injectScript);
+
+      $('a').removeAttr('target').removeAttr('rel');
       $('form').each((i, el) => {
         const action = $(el).attr('action') || '';
         try {
           const absoluteAction = new URL(action, targetUrl).href;
-          $(el).attr('action', '/proxy');
-          $(el).attr('method', 'GET');
-          $(el).removeAttr('target');
+          $(el).attr('action', '/proxy').attr('method', 'GET').removeAttr('target');
           if ($(el).find('input[name="url"]').length === 0) {
             $(el).prepend('<input type="hidden" name="url" value="' + absoluteAction + '">');
           }
         } catch (e) {}
       });
 
-      if (pool) pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch(() => {});
       return res.send($.html());
     }
 
     if (contentType.includes('text/css')) {
       let css = response.data.toString('utf-8');
-      css = css.replace(/url\(['"]?([^'")]*)['"]?\)/g, (match, p1) => {
+      css = css.replace(/url\\(['"]?([^'")]*)['"]?\\)/g, (match, p1) => {
         try {
           if (p1.startsWith('data:')) return match;
           return 'url("/proxy?url=' + encodeURIComponent(new URL(p1, targetUrl).href) + '")';
