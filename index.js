@@ -7,10 +7,14 @@ const { Pool } = require('pg');
 const app = express();
 const port = process.env.PORT || 3000;
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+// DB 연결 설정
+let pool;
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+  });
+}
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -18,69 +22,83 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// 핵심 프록시 엔진
 app.get('/proxy', async (req, res) => {
-  let targetUrl = req.query.url;
-
-  // [수정] 구글 검색(q) 파라미터가 들어올 경우 처리
-  if (req.query.q) {
-    if (targetUrl && targetUrl.includes('google.com')) {
-        // 구글 검색 주소 형식을 강제로 맞춤
-        targetUrl = `https://www.google.com/search?q=${encodeURIComponent(req.query.q)}`;
-    }
-  }
-
+  const targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('URL이 필요합니다.');
 
   try {
+    // 접속한 기기의 정보를 그대로 전달하여 레이아웃 최적화
+    const userAgent = req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36';
+
     const response = await axios.get(targetUrl, {
       headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': userAgent,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
       },
-      timeout: 10000
+      responseType: 'arraybuffer', // 이미지/폰트 깨짐 방지
+      timeout: 15000
     });
 
-    const $ = cheerio.load(response.data);
+    const contentType = response.headers['content-type'] || '';
+    res.set('Content-Type', contentType);
 
-    // 1. 이미지/리소스 경로 수정
-    $('img, link, script').each((i, el) => {
-      const attr = $(el).is('img') ? 'src' : ($(el).is('link') ? 'href' : 'src');
-      const val = $(el).attr(attr);
-      if (val && !val.startsWith('http') && !val.startsWith('data:')) {
-        try { $(el).attr(attr, new URL(val, targetUrl).href); } catch (e) {}
-      }
-    });
+    // HTML 처리: 상대 경로를 절대 경로(프록시 주소)로 치환
+    if (contentType.includes('text/html')) {
+      const $ = cheerio.load(response.data.toString('utf-8'));
 
-    // 2. 링크(a) 클릭 시 프록시 유지
-    $('a').each((i, el) => {
-      const href = $(el).attr('href');
-      if (href && !href.startsWith('#') && !href.startsWith('javascript')) {
+      const rewrite = (tag, attr) => {
+        $(tag).each((i, el) => {
+          const val = $(el).attr(attr);
+          if (val && !val.startsWith('data:') && !val.startsWith('javascript:')) {
+            try {
+              const absolute = new URL(val, targetUrl).href;
+              $(el).attr(attr, `/proxy?url=${encodeURIComponent(absolute)}`);
+            } catch (e) {}
+          }
+        });
+      };
+
+      rewrite('img', 'src');
+      rewrite('link', 'href');
+      rewrite('script', 'src');
+      rewrite('a', 'href');
+
+      // 폼(검색 등) 처리
+      $('form').each((i, el) => {
+        const action = $(el).attr('action') || '';
         try {
-          const absoluteUrl = new URL(href, targetUrl).href;
-          $(el).attr('href', `/proxy?url=${encodeURIComponent(absoluteUrl)}`);
+          const absoluteAction = new URL(action, targetUrl).href;
+          $(el).attr('action', '/proxy');
+          $(el).attr('method', 'GET');
+          if ($(el).find('input[name="url"]').length === 0) {
+            $(el).prepend(`<input type="hidden" name="url" value="${absoluteAction}">`);
+          }
         } catch (e) {}
+      });
+
+      if (pool) {
+        pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch(() => {});
       }
-    });
 
-    // 3. [핵심 수정] 폼(검색창) 처리
-    $('form').each((i, el) => {
-      // 구글 같은 경우 action이 '/search'로 되어 있으면 절대 경로로 변경
-      const action = $(el).attr('action') || '';
-      try {
-        const absoluteAction = new URL(action, targetUrl).href;
-        $(el).attr('method', 'GET'); // 강제로 GET 방식으로 통일
-        $(el).attr('action', '/proxy'); 
-        // 목적지 주소를 숨겨진 input으로 전달
-        if ($(el).find('input[name="url"]').length === 0) {
-            $(el).append(`<input type="hidden" name="url" value="${absoluteAction}">`);
-        }
-      } catch (e) {}
-    });
+      return res.send($.html());
+    }
 
-    // 4. DB 저장
-    pool.query('INSERT INTO history (url) VALUES ($1)', [targetUrl]).catch(() => {});
+    // CSS 처리: url() 경로 치환
+    if (contentType.includes('text/css')) {
+      let css = response.data.toString('utf-8');
+      css = css.replace(/url\(['"]?([^'")]*)['"]?\)/g, (match, p1) => {
+        try {
+          if (p1.startsWith('data:')) return match;
+          const absolute = new URL(p1, targetUrl).href;
+          return `url("/proxy?url=${encodeURIComponent(absolute)}")`;
+        } catch (e) { return match; }
+      });
+      return res.send(css);
+    }
 
-    res.send($.html());
+    // 그 외 파일(이미지 등)은 그대로 전송
+    res.send(response.data);
 
   } catch (error) {
     res.status(500).send(`접속 오류: ${error.message}`);
