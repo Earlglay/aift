@@ -21,6 +21,7 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
+  // [수정] 검색 파라미터 강제 병합
   if (targetUrl) {
     try {
       const urlObj = new URL(targetUrl);
@@ -34,12 +35,9 @@ app.get('/proxy', async (req, res) => {
   if (!targetUrl) return res.status(400).send('URL이 필요합니다.');
 
   try {
-    const userAgent = req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
-
     const response = await axios.get(targetUrl, {
       headers: { 
-        'User-Agent': userAgent,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': new URL(targetUrl).origin 
       },
       responseType: 'arraybuffer',
@@ -52,12 +50,9 @@ app.get('/proxy', async (req, res) => {
 
     if (contentType.includes('text/html')) {
       let html = response.data.toString('utf-8');
-      
-      // 보안 정책(CSP) 해제 - 브라우저가 외부 스크립트 차단하는 것 방지
-      html = html.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>/gi, '');
-
       const $ = cheerio.load(html);
 
+      // 모든 상대 경로를 프록시 절대 경로로 변환
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -69,83 +64,77 @@ app.get('/proxy', async (req, res) => {
           }
         });
       };
+      rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      rewrite('img', 'src');
-      rewrite('link', 'href');
-      rewrite('script', 'src');
-      rewrite('a', 'href');
-
-      // [핵심] 초강력 자바스크립트 가로채기 주입
+      // [핵심] 클라이언트 단에서 실행될 초강력 가로채기 스크립트
       const injectScript = `
         <script>
-          // 모든 클릭을 가로채서 절대 놓치지 않음
-          window.onclick = function(e) {
-            var el = e.target;
-            while (el && el.tagName !== 'A') el = el.parentNode;
-            if (el && el.href) {
-              if (el.href.indexOf(window.location.host) === -1) {
+          (function() {
+            // 1. 모든 클릭 가로채기 (네이버의 동적 클릭 포함)
+            document.addEventListener('click', function(e) {
+              var el = e.target.closest('a');
+              if (el && el.href && !el.href.includes(window.location.host)) {
+                if (el.href.startsWith('javascript:') || el.href.startsWith('#')) return;
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 window.location.href = '/proxy?url=' + encodeURIComponent(el.href);
-                return false;
               }
-            }
-          };
-          // 원본 스크립트가 주소를 바꾸지 못하게 방어
-          var originalLocation = window.location.href;
-          window.onbeforeunload = function() {
-            // 원치 않는 리다이렉트 감지 시 로직 추가 가능
-          };
+            }, true);
+
+            // 2. 검색 폼 전송 가로채기
+            document.addEventListener('submit', function(e) {
+              var form = e.target;
+              var action = form.action || window.location.href;
+              if (!action.includes(window.location.host)) {
+                e.preventDefault();
+                var formData = new FormData(form);
+                var params = new URLSearchParams(formData);
+                var fullUrl = action + (action.includes('?') ? '&' : '?') + params.toString();
+                window.location.href = '/proxy?url=' + encodeURIComponent(fullUrl);
+              }
+            }, true);
+
+            // 3. window.open 가로채기
+            var originalOpen = window.open;
+            window.open = function(url) {
+              if (url) {
+                var absUrl = new URL(url, window.location.href).href;
+                window.location.href = '/proxy?url=' + encodeURIComponent(absUrl);
+              }
+              return null;
+            };
+          })();
         </script>
       `;
-      
       $('head').prepend(injectScript);
-      $('a').removeAttr('target').removeAttr('rel');
-      
-      // 인라인 스크립트(onclick 등) 내의 주소도 억지로 바꿈
-      $('*[onclick]').each((i, el) => {
-        $(el).removeAttr('onclick'); 
-      });
+
+      // 기존 폼의 target 제거
+      $('form').removeAttr('target');
+      $('a').removeAttr('target').removeAttr('onclick');
 
       return res.send($.html());
     }
-
-    if (contentType.includes('text/css')) {
-      let css = response.data.toString('utf-8');
-      css = css.replace(/url\(['"]?([^'")]*)['"]?\)/g, (match, p1) => {
-        try {
-          if (p1.startsWith('data:')) return match;
-          return 'url("/proxy?url=' + encodeURIComponent(new URL(p1, targetUrl).href) + '")';
-        } catch (e) { return match; }
-      });
-      return res.send(css);
-    }
+    
     res.send(response.data);
   } catch (error) {
     res.status(500).send('Proxy Error: ' + error.message);
   }
 });
 
+// [와일드카드] 모든 경로 이탈 방지
 app.get('*', (req, res) => {
-  const path = req.path;
-  if (path === '/proxy' || path === '/search' || path === '/') return;
-
-  const referer = req.headers.referer;
-  const originDomain = 'https://www.naver.com'; // 기본값을 네이버로 설정
-
-  if (referer && referer.includes('/proxy?url=')) {
-    try {
-      const refUrl = new URL(referer);
-      const originalReferer = refUrl.searchParams.get('url');
-      if (originalReferer) {
-        const lastBase = new URL(originalReferer).origin;
-        return res.redirect('/proxy?url=' + encodeURIComponent(lastBase + req.originalUrl));
-      }
-    } catch (e) {}
-  }
+  if (['/proxy', '/search', '/'].includes(req.path)) return;
   
-  // 정보를 알 수 없을 때는 네이버라고 가정하고 보냄 (홈으로 튕김 방지)
-  res.redirect('/proxy?url=' + encodeURIComponent(originDomain + req.originalUrl));
+  const referer = req.headers.referer;
+  let base = 'https://www.naver.com';
+  
+  if (referer && referer.includes('url=')) {
+    try {
+      const urlParams = new URL(referer).searchParams;
+      base = new URL(urlParams.get('url')).origin;
+    } catch(e) {}
+  }
+  res.redirect('/proxy?url=' + encodeURIComponent(base + req.originalUrl));
 });
 
 app.listen(port, () => { console.log('Server is running'); });
