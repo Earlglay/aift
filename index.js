@@ -2,15 +2,9 @@ const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
 const path = require('path');
-const { Pool } = require('pg');
 
 const app = express();
 const port = process.env.PORT || 3000;
-
-let pool;
-if (process.env.DATABASE_URL) {
-  pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
-}
 
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -21,20 +15,19 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // [보정 1] url 파라미터가 없는데 query만 들어온 경우 (검색 시도 상황)
-  if (!targetUrl && req.query.query) {
-    targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(req.query.query)}`;
+  // [긴급 복구] URL이 없는데 검색어만 들어온 경우 네이버로 연결
+  if (!targetUrl && (req.query.query || req.query.q)) {
+    const q = req.query.query || req.query.q;
+    targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
   }
 
   if (!targetUrl) return res.redirect('/');
 
   try {
-    // [보정 2] 현재 들어온 모든 쿼리 파라미터를 타겟 URL에 강제로 합침
+    // 파라미터 병합
     const urlObj = new URL(targetUrl);
     Object.keys(req.query).forEach(key => {
-      if (key !== 'url') {
-        urlObj.searchParams.set(key, req.query[key]);
-      }
+      if (key !== 'url') urlObj.searchParams.set(key, req.query[key]);
     });
     targetUrl = urlObj.href;
 
@@ -54,7 +47,7 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 1. 기본 경로 치환
+      // 1. 모든 리소스 경로 치환
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -68,7 +61,7 @@ app.get('/proxy', async (req, res) => {
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      // 2. [핵심] 브라우저 내 '전송 가로채기' 스크립트 주입
+      // 2. 브라우저 측 가로채기 (가장 안정적인 방식)
       const injectScript = `
         <script>
           (function() {
@@ -78,46 +71,38 @@ app.get('/proxy', async (req, res) => {
               if (a && a.href && !a.href.includes(window.location.host)) {
                 if (a.href.startsWith('javascript:') || a.href.startsWith('#')) return;
                 e.preventDefault();
-                e.stopImmediatePropagation();
                 window.location.href = '/proxy?url=' + encodeURIComponent(a.href);
               }
             }, true);
 
-            // [집중 수정] 모든 폼(검색창) 전송 가로채기
+            // [수정] 폼 전송 시 주소창에 직접 목적지를 꽂아넣음
             window.addEventListener('submit', function(e) {
-              e.preventDefault();
-              e.stopImmediatePropagation();
-              
               const form = e.target;
+              // 이미 우리 프록시로 가고 있다면 통과
+              if (form.action.includes(window.location.host + '/proxy')) return;
+              
+              e.preventDefault();
               const action = new URL(form.action || window.location.href, window.location.href).href;
-              const formData = new FormData(form);
-              const params = new URLSearchParams();
+              const params = new URLSearchParams(new FormData(form));
+              const finalUrl = action.split('?')[0] + '?' + params.toString();
               
-              // 폼 안의 모든 입력값을 주소창 파라미터로 변환
-              for (const [key, value] of formData.entries()) {
-                params.append(key, value);
-              }
-              
-              // 최종 목적지 구성 (우리 프록시 주소 + 네이버 검색 주소 + 검색어들)
-              const finalTarget = action.split('?')[0] + '?' + params.toString();
-              window.location.href = '/proxy?url=' + encodeURIComponent(finalTarget);
+              window.location.href = window.location.origin + '/proxy?url=' + encodeURIComponent(finalUrl);
             }, true);
             
-            // History API 보호 (메인 튕김 방지)
-            const originalPush = history.pushState;
-            history.pushState = function(state, title, url) {
-              if (url && !url.includes(window.location.host)) {
-                return window.location.href = '/proxy?url=' + encodeURIComponent(new URL(url, window.location.href).href);
-              }
-              return originalPush.apply(this, arguments);
+            // 네이버의 History 조작(튕김 현상) 방지
+            const wrap = (u) => u.includes(window.location.host) ? u : (window.location.origin + '/proxy?url=' + encodeURIComponent(new URL(u, window.location.href).href));
+            const orgPush = history.pushState;
+            history.pushState = function(s, t, u) {
+              if (u) return window.location.href = wrap(u);
+              return orgPush.apply(this, arguments);
             };
           })();
         </script>
       `;
       $('head').prepend(injectScript);
 
-      // 3. HTML 내의 폼 속성 무력화 (JS가 가로채기 쉽게)
-      $('form').removeAttr('onsubmit').attr('action', 'javascript:void(0);');
+      // 3. 폼 설정 초기화 (브라우저 기본 동작 사용)
+      $('form').removeAttr('onsubmit'); 
 
       return res.send($.html());
     }
@@ -127,20 +112,20 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// [와일드카드] 모든 이탈 경로 강제 복구
+// [와일드카드] 길 잃은 요청 복구
 app.get('*', (req, res) => {
   const path = req.path;
   if (['/proxy', '/'].includes(path) || path.includes('.')) return res.redirect('/');
-
+  
   const referer = req.headers.referer;
   let domain = 'https://www.naver.com';
   if (referer && referer.includes('url=')) {
     try {
-      const prevUrl = new URL(referer).searchParams.get('url');
-      if (prevUrl) domain = new URL(prevUrl).origin;
+      const prev = new URL(referer).searchParams.get('url');
+      if (prev) domain = new URL(prev).origin;
     } catch (e) {}
   }
   res.redirect('/proxy?url=' + encodeURIComponent(domain + req.originalUrl));
 });
 
-app.listen(port, () => { console.log('Final Proxy Server Running'); });
+app.listen(port, () => { console.log('Proxy Fixed'); });
