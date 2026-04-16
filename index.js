@@ -21,20 +21,27 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // [수정] 검색 파라미터 강제 병합
-  if (targetUrl) {
-    try {
-      const urlObj = new URL(targetUrl);
-      Object.keys(req.query).forEach(key => {
-        if (key !== 'url') urlObj.searchParams.set(key, req.query[key]);
-      });
-      targetUrl = urlObj.href;
-    } catch (e) {}
+  // [중요] 검색어만 오고 url이 없는 경우를 위한 자동 보정 로직
+  if (!targetUrl) {
+    if (req.query.query) { // 네이버 검색어 케이스
+      targetUrl = 'https://search.naver.com/search.naver?query=' + encodeURIComponent(req.query.query);
+    } else if (req.query.q) { // 구글/빙 검색어 케이스
+      targetUrl = 'https://www.google.com/search?q=' + encodeURIComponent(req.query.q);
+    }
   }
 
-  if (!targetUrl) return res.status(400).send('URL이 필요합니다.');
+  if (!targetUrl) return res.status(400).send('URL이 필요합니다. (검색어 파라미터 누락)');
 
   try {
+    // 나머지 파라미터들(sca_esv, ei 등)을 targetUrl에 병합
+    const urlObj = new URL(targetUrl);
+    Object.keys(req.query).forEach(key => {
+      if (key !== 'url' && key !== 'query' && key !== 'q') {
+        urlObj.searchParams.set(key, req.query[key]);
+      }
+    });
+    targetUrl = urlObj.href;
+
     const response = await axios.get(targetUrl, {
       headers: { 
         'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -49,92 +56,70 @@ app.get('/proxy', async (req, res) => {
     res.set('Content-Type', contentType);
 
     if (contentType.includes('text/html')) {
-      let html = response.data.toString('utf-8');
-      const $ = cheerio.load(html);
+      const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 모든 상대 경로를 프록시 절대 경로로 변환
+      // 경로 치환
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
           if (val && !val.startsWith('data:') && !val.startsWith('javascript:')) {
             try {
-              const absolute = new URL(val, targetUrl).href;
-              $(el).attr(attr, '/proxy?url=' + encodeURIComponent(absolute));
+              const abs = new URL(val, targetUrl).href;
+              $(el).attr(attr, '/proxy?url=' + encodeURIComponent(abs));
             } catch (e) {}
           }
         });
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      // [핵심] 클라이언트 단에서 실행될 초강력 가로채기 스크립트
+      // [핵심] 폼(검색창) 처리 보강
+      $('form').each((i, el) => {
+        const action = $(el).attr('action') || '';
+        try {
+          const absoluteAction = new URL(action, targetUrl).href;
+          $(el).attr('action', '/proxy');
+          $(el).attr('method', 'GET');
+          // 기존에 url hidden input이 없다면 생성하여 목적지 주입
+          if ($(el).find('input[name="url"]').length === 0) {
+            $(el).prepend(`<input type="hidden" name="url" value="${absoluteAction}">`);
+          }
+        } catch (e) {}
+      });
+
+      // 브라우저 측 가로채기 스크립트 (이전과 동일)
       const injectScript = `
         <script>
-          (function() {
-            // 1. 모든 클릭 가로채기 (네이버의 동적 클릭 포함)
-            document.addEventListener('click', function(e) {
-              var el = e.target.closest('a');
-              if (el && el.href && !el.href.includes(window.location.host)) {
-                if (el.href.startsWith('javascript:') || el.href.startsWith('#')) return;
-                e.preventDefault();
-                e.stopImmediatePropagation();
-                window.location.href = '/proxy?url=' + encodeURIComponent(el.href);
+          document.addEventListener('submit', function(e) {
+            var form = e.target;
+            if (!form.action.includes(window.location.host)) {
+              var urlInput = form.querySelector('input[name="url"]');
+              if (!urlInput) {
+                var action = form.action || window.location.href;
+                var input = document.createElement('input');
+                input.type = 'hidden';
+                input.name = 'url';
+                input.value = action;
+                form.prepend(input);
               }
-            }, true);
-
-            // 2. 검색 폼 전송 가로채기
-            document.addEventListener('submit', function(e) {
-              var form = e.target;
-              var action = form.action || window.location.href;
-              if (!action.includes(window.location.host)) {
-                e.preventDefault();
-                var formData = new FormData(form);
-                var params = new URLSearchParams(formData);
-                var fullUrl = action + (action.includes('?') ? '&' : '?') + params.toString();
-                window.location.href = '/proxy?url=' + encodeURIComponent(fullUrl);
-              }
-            }, true);
-
-            // 3. window.open 가로채기
-            var originalOpen = window.open;
-            window.open = function(url) {
-              if (url) {
-                var absUrl = new URL(url, window.location.href).href;
-                window.location.href = '/proxy?url=' + encodeURIComponent(absUrl);
-              }
-              return null;
-            };
-          })();
+            }
+          }, true);
         </script>
       `;
       $('head').prepend(injectScript);
 
-      // 기존 폼의 target 제거
-      $('form').removeAttr('target');
-      $('a').removeAttr('target').removeAttr('onclick');
-
       return res.send($.html());
     }
-    
     res.send(response.data);
   } catch (error) {
     res.status(500).send('Proxy Error: ' + error.message);
   }
 });
 
-// [와일드카드] 모든 경로 이탈 방지
+// 모든 경로 이탈 방지 와일드카드
 app.get('*', (req, res) => {
   if (['/proxy', '/search', '/'].includes(req.path)) return;
-  
-  const referer = req.headers.referer;
-  let base = 'https://www.naver.com';
-  
-  if (referer && referer.includes('url=')) {
-    try {
-      const urlParams = new URL(referer).searchParams;
-      base = new URL(urlParams.get('url')).origin;
-    } catch(e) {}
-  }
-  res.redirect('/proxy?url=' + encodeURIComponent(base + req.originalUrl));
+  const originDomain = 'https://www.naver.com';
+  res.redirect('/proxy?url=' + encodeURIComponent(originDomain + req.originalUrl));
 });
 
 app.listen(port, () => { console.log('Server is running'); });
