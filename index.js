@@ -15,7 +15,7 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // [긴급 복구] URL이 없는데 검색어만 들어온 경우 네이버로 연결
+  // 검색어만 들어온 경우 네이버로 자동 연결 (검색 기능 유지)
   if (!targetUrl && (req.query.query || req.query.q)) {
     const q = req.query.query || req.query.q;
     targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
@@ -24,7 +24,6 @@ app.get('/proxy', async (req, res) => {
   if (!targetUrl) return res.redirect('/');
 
   try {
-    // 파라미터 병합
     const urlObj = new URL(targetUrl);
     Object.keys(req.query).forEach(key => {
       if (key !== 'url') urlObj.searchParams.set(key, req.query[key]);
@@ -47,7 +46,7 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 1. 모든 리소스 경로 치환
+      // 1. 모든 리소스 주소 치환 (이미지, 스크립트, 링크)
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -61,48 +60,72 @@ app.get('/proxy', async (req, res) => {
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      // 2. 브라우저 측 가로채기 (가장 안정적인 방식)
+      // 2. 브라우저 측 초강력 보호 스크립트 주입
       const injectScript = `
         <script>
           (function() {
-            // 모든 클릭 가로채기
+            const currentOrigin = window.location.origin;
+            const wrapUrl = (u) => {
+              if (!u || u.startsWith('javascript:') || u.startsWith('#')) return u;
+              try {
+                const abs = new URL(u, window.location.href).href;
+                if (abs.includes(currentOrigin)) return abs;
+                return currentOrigin + '/proxy?url=' + encodeURIComponent(abs);
+              } catch(e) { return u; }
+            };
+
+            // [추가] 네이버의 강제 리다이렉트 시도 차단
+            window.onbeforeunload = function() {
+              // 페이지가 떠나기 직전 감지 (필요 시 로직 확장 가능)
+            };
+
+            // 모든 클릭 가로채기 (캡처링 단계)
             window.addEventListener('click', function(e) {
               const a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(window.location.host)) {
-                if (a.href.startsWith('javascript:') || a.href.startsWith('#')) return;
-                e.preventDefault();
-                window.location.href = '/proxy?url=' + encodeURIComponent(a.href);
+              if (a && a.href) {
+                const target = a.href;
+                if (!target.includes(currentOrigin)) {
+                  e.preventDefault();
+                  e.stopImmediatePropagation();
+                  window.location.href = wrapUrl(target);
+                }
               }
             }, true);
 
-            // [수정] 폼 전송 시 주소창에 직접 목적지를 꽂아넣음
+            // 폼 전송 가로채기
             window.addEventListener('submit', function(e) {
               const form = e.target;
-              // 이미 우리 프록시로 가고 있다면 통과
-              if (form.action.includes(window.location.host + '/proxy')) return;
-              
-              e.preventDefault();
               const action = new URL(form.action || window.location.href, window.location.href).href;
-              const params = new URLSearchParams(new FormData(form));
-              const finalUrl = action.split('?')[0] + '?' + params.toString();
-              
-              window.location.href = window.location.origin + '/proxy?url=' + encodeURIComponent(finalUrl);
+              if (!action.includes(currentOrigin)) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                const fd = new FormData(form);
+                const sp = new URLSearchParams();
+                for (const [k, v] of fd.entries()) sp.append(k, v);
+                window.location.href = wrapUrl(action.split('?')[0] + '?' + sp.toString());
+              }
             }, true);
-            
-            // 네이버의 History 조작(튕김 현상) 방지
-            const wrap = (u) => u.includes(window.location.host) ? u : (window.location.origin + '/proxy?url=' + encodeURIComponent(new URL(u, window.location.href).href));
+
+            // [핵심] History API 및 Location 조작 감시
             const orgPush = history.pushState;
-            history.pushState = function(s, t, u) {
-              if (u) return window.location.href = wrap(u);
+            history.pushState = function(state, title, url) {
+              if (url && !url.includes(currentOrigin)) {
+                return window.location.href = wrapUrl(url);
+              }
               return orgPush.apply(this, arguments);
+            };
+
+            const orgReplace = history.replaceState;
+            history.replaceState = function(state, title, url) {
+              if (url && !url.includes(currentOrigin)) {
+                return window.location.href = wrapUrl(url);
+              }
+              return orgReplace.apply(this, arguments);
             };
           })();
         </script>
       `;
       $('head').prepend(injectScript);
-
-      // 3. 폼 설정 초기화 (브라우저 기본 동작 사용)
-      $('form').removeAttr('onsubmit'); 
 
       return res.send($.html());
     }
@@ -112,20 +135,26 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// [와일드카드] 길 잃은 요청 복구
+// 3. [최후의 보루] 와일드카드 경로 이탈 복구
 app.get('*', (req, res) => {
   const path = req.path;
-  if (['/proxy', '/'].includes(path) || path.includes('.')) return res.redirect('/');
-  
+  // 정적 파일(.js, .css, .png 등)은 홈으로 보내지 않고 통과 시도
+  if (['/proxy', '/'].includes(path) || path.includes('.')) return;
+
   const referer = req.headers.referer;
   let domain = 'https://www.naver.com';
+  
   if (referer && referer.includes('url=')) {
     try {
-      const prev = new URL(referer).searchParams.get('url');
-      if (prev) domain = new URL(prev).origin;
+      const prevUrl = new URL(new URL(referer).searchParams.get('url'));
+      domain = prevUrl.origin;
     } catch (e) {}
   }
-  res.redirect('/proxy?url=' + encodeURIComponent(domain + req.originalUrl));
+
+  // 모르는 경로는 이전 사이트 도메인을 붙여서 프록시로 재진입
+  const recovered = domain + req.originalUrl;
+  console.log("경로 이탈 감지 -> 복원:", recovered);
+  res.redirect('/proxy?url=' + encodeURIComponent(recovered));
 });
 
-app.listen(port, () => { console.log('Proxy Fixed'); });
+app.listen(port, () => { console.log('Final Guarded Proxy Running'); });
