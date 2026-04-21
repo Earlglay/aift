@@ -15,16 +15,20 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // 1. 검색어 자동 보정
-  if (!targetUrl && (req.query.query || req.query.q)) {
-    const q = req.query.query || req.query.q;
-    targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
+  // 검색어 파라미터 통합 처리 (구글/네이버/레딧 등)
+  if (!targetUrl) {
+    const q = req.query.query || req.query.q || req.query.searchTerm;
+    if (q) {
+      // 기본값은 네이버 검색으로 설정 (필요시 변경 가능)
+      targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
+    } else {
+      return res.redirect('/');
+    }
   }
-
-  if (!targetUrl) return res.redirect('/');
 
   try {
     const urlObj = new URL(targetUrl);
+    // 모든 쿼리를 합침
     Object.keys(req.query).forEach(key => {
       if (key !== 'url') urlObj.searchParams.set(key, req.query[key]);
     });
@@ -32,15 +36,19 @@ app.get('/proxy', async (req, res) => {
 
     const response = await axios.get(targetUrl, {
       headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': 'https://www.naver.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Referer': urlObj.origin
       },
       responseType: 'arraybuffer',
-      timeout: 10000,
+      timeout: 15000,
       validateStatus: false 
     });
+
+    // 쿠키 전달 (로그인 등 세션 유지에 필요)
+    const setCookie = response.headers['set-cookie'];
+    if (setCookie) res.set('set-cookie', setCookie);
 
     const contentType = response.headers['content-type'] || '';
     res.set('Content-Type', contentType);
@@ -48,7 +56,7 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 모든 경로 리라이팅
+      // 경로 치환
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -61,54 +69,56 @@ app.get('/proxy', async (req, res) => {
         });
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
+      
+      // 폼 처리
+      $('form').attr('action', '/proxy').attr('method', 'GET');
 
-      // [초강력] JS 보안 우회 스크립트
       const injectScript = `
         <script>
           (function() {
-            const PROXY_URL = window.location.origin + '/proxy?url=';
+            const currentOrigin = window.location.origin;
             const wrap = (u) => {
               if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#')) return u;
               try {
                 const abs = new URL(u, window.location.href).href;
-                if (abs.includes(window.location.host)) return abs;
-                return PROXY_URL + encodeURIComponent(abs);
+                if (abs.includes(currentOrigin)) return abs;
+                return currentOrigin + '/proxy?url=' + encodeURIComponent(abs);
               } catch(e) { return u; }
             };
 
-            // 1. 도메인 속이기 (네이버 JS가 도메인을 체크할 때 네이버인 척 함)
-            try {
-              Object.defineProperty(document, 'domain', { get: () => 'naver.com' });
-            } catch(e) {}
+            // 1. 도메인 속이기 (네이버 튕김 방지)
+            try { Object.defineProperty(document, 'domain', { get: () => 'naver.com' }); } catch(e) {}
 
-            // 2. 모든 클릭/이동 가로채기 (최우선 순위)
+            // 2. 모든 클릭/이동 가로채기
             window.addEventListener('click', function(e) {
               const a = e.target.closest('a');
-              if (a && a.href) {
-                const target = a.href;
-                if (!target.includes(window.location.host)) {
-                  e.preventDefault();
-                  e.stopImmediatePropagation();
-                  window.location.href = wrap(target);
-                }
+              if (a && a.href && !a.href.includes(currentOrigin)) {
+                e.preventDefault();
+                window.location.href = wrap(a.href);
               }
             }, true);
 
-            // 3. 비동기 이동(Location 조작) 감시 및 가로채기
-            const orgPush = history.pushState;
-            const orgReplace = history.replaceState;
-            history.pushState = function(s, t, u) { return u ? (window.location.href = wrap(u)) : orgPush.apply(this, arguments); };
-            history.replaceState = function(s, t, u) { return u ? (window.location.href = wrap(u)) : orgReplace.apply(this, arguments); };
+            // 3. 구글/레딧 등 SPA 사이트용 History API 가로채기
+            const patchHistory = (type) => {
+              const orig = history[type];
+              history[type] = function(state, title, url) {
+                if (url && !url.includes(currentOrigin)) {
+                  window.location.href = wrap(url);
+                  return;
+                }
+                return orig.apply(this, arguments);
+              };
+            };
+            patchHistory('pushState');
+            patchHistory('replaceState');
 
-            // 4. 폼 전송 가로채기
+            // 4. 폼 전송 가로채기 (검색 기능)
             window.addEventListener('submit', function(e) {
               const form = e.target;
-              const action = new URL(form.action || window.location.href, window.location.href).href;
-              if (!action.includes(window.location.host)) {
+              if (!form.action.includes(currentOrigin)) {
                 e.preventDefault();
-                const fd = new FormData(form);
-                const sp = new URLSearchParams();
-                for (const [k, v] of fd.entries()) sp.append(k, v);
+                const action = new URL(form.action || window.location.href, window.location.href).href;
+                const sp = new URLSearchParams(new FormData(form));
                 window.location.href = wrap(action.split('?')[0] + '?' + sp.toString());
               }
             }, true);
@@ -125,15 +135,16 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
+// 이탈 방지 와일드카드
 app.get('*', (req, res) => {
   const referer = req.headers.referer;
   if (referer && referer.includes('url=')) {
     try {
-      const prevUrl = new URL(new URL(referer).searchParams.get('url'));
-      return res.redirect('/proxy?url=' + encodeURIComponent(prevUrl.origin + req.originalUrl));
+      const prev = new URL(new URL(referer).searchParams.get('url'));
+      return res.redirect('/proxy?url=' + encodeURIComponent(prev.origin + req.originalUrl));
     } catch(e) {}
   }
   res.redirect('/');
 });
 
-app.listen(port, () => { console.log('Final Proxy Deployment Active'); });
+app.listen(port, () => { console.log('Proxy Deployment Active'); });
