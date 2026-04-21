@@ -15,7 +15,7 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // 검색어 보정 (네이버, 구글 등 범용)
+  // 범용 검색어 보정
   if (!targetUrl && (req.query.query || req.query.q)) {
     const q = req.query.query || req.query.q;
     targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
@@ -25,7 +25,6 @@ app.get('/proxy', async (req, res) => {
 
   try {
     const urlObj = new URL(targetUrl);
-    // 모든 쿼리 파라미터를 강제 병합하여 유실 방지
     Object.keys(req.query).forEach(key => {
       if (key !== 'url') urlObj.searchParams.set(key, req.query[key]);
     });
@@ -34,8 +33,7 @@ app.get('/proxy', async (req, res) => {
     const response = await axios.get(targetUrl, {
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': 'https://www.naver.com/',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
+        'Referer': new URL(targetUrl).origin
       },
       responseType: 'arraybuffer',
       timeout: 10000,
@@ -48,7 +46,7 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 모든 경로 치환 (이미지, 스크립트 등)
+      // 1. HTML 태그 경로 치환 (기본)
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -62,48 +60,53 @@ app.get('/proxy', async (req, res) => {
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      // [핵심] 클라이언트 단 보안 우회 및 가로채기
+      // 2. [초강력] 자바스크립트 엔진 레벨 가로채기
       const injectScript = `
         <script>
           (function() {
-            const currentOrigin = window.location.origin;
+            const origin = window.location.origin;
             const wrap = (u) => {
-              if(!u || u.startsWith('javascript:') || u.startsWith('#')) return u;
-              try {
-                const abs = new URL(u, window.location.href).href;
-                if (abs.includes(currentOrigin)) return abs;
-                return currentOrigin + '/proxy?url=' + encodeURIComponent(abs);
-              } catch(e) { return u; }
+              if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#') || u.startsWith(origin)) return u;
+              try { return origin + '/proxy?url=' + encodeURIComponent(new URL(u, window.location.href).href); } catch(e) { return u; }
             };
 
-            // 1. 모든 클릭 캡처링 (가장 먼저 실행되도록 true 설정)
-            window.addEventListener('click', function(e) {
+            // [클릭] 캡처링 단계에서 원천 봉쇄
+            window.addEventListener('click', e => {
               const a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(currentOrigin)) {
-                e.preventDefault();
-                e.stopImmediatePropagation();
+              if (a && a.href && !a.href.includes(origin)) {
+                e.preventDefault(); e.stopImmediatePropagation();
                 window.location.href = wrap(a.href);
               }
             }, true);
 
-            // 2. 폼 전송 가로채기
-            window.addEventListener('submit', function(e) {
-              const form = e.target;
-              const action = new URL(form.action || window.location.href, window.location.href).href;
-              if (!action.includes(currentOrigin)) {
-                e.preventDefault();
-                e.stopImmediatePropagation();
-                const formData = new FormData(form);
-                const sp = new URLSearchParams();
-                for (const [k, v] of formData.entries()) sp.append(k, v);
-                window.location.href = wrap(action.split('?')[0] + '?' + sp.toString());
+            // [비동기] Fetch 및 XHR 가로채기 (네이버의 내부 통신 감시)
+            const orgFetch = window.fetch;
+            window.fetch = function(r, i) {
+              if(typeof r === 'string') r = wrap(r);
+              return orgPush.apply(this, arguments);
+            };
+
+            // [주소창] History API 조작 감시 (튕김 방지 핵심)
+            const patchProp = (obj, prop) => {
+              const org = obj[prop];
+              obj[prop] = function(s, t, u) {
+                if(u) window.location.href = wrap(u);
+                else return org.apply(this, arguments);
+              };
+            };
+            patchProp(history, 'pushState');
+            patchProp(history, 'replaceState');
+
+            // [폼] 전송 가로채기
+            window.addEventListener('submit', e => {
+              const f = e.target;
+              const act = new URL(f.action || window.location.href, window.location.href).href;
+              if(!act.includes(origin)) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                const params = new URLSearchParams(new FormData(f));
+                window.location.href = wrap(act.split('?')[0] + '?' + params.toString());
               }
             }, true);
-
-            // 3. 네이버/구글의 History API 조작 원천 차단
-            const noop = () => {};
-            // history.pushState = noop; // 필요 시 주석 해제하여 History API 아예 무력화
-            // history.replaceState = noop;
           })();
         </script>
       `;
@@ -117,16 +120,19 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
+// [와일드카드] 길 잃은 요청 자동 복원
 app.get('*', (req, res) => {
-  // 모르는 주소로 튕겼을 때 마지막 Referer를 보고 자동 복구 시도
+  const path = req.path;
+  if (['/proxy', '/'].includes(path) || path.includes('.')) return;
+
   const referer = req.headers.referer;
+  let domain = 'https://www.naver.com';
   if (referer && referer.includes('url=')) {
     try {
-      const prevUrl = new URL(new URL(referer).searchParams.get('url'));
-      return res.redirect('/proxy?url=' + encodeURIComponent(prevUrl.origin + req.originalUrl));
+      domain = new URL(decodeURIComponent(new URL(referer).searchParams.get('url'))).origin;
     } catch(e) {}
   }
-  res.redirect('/');
+  res.redirect('/proxy?url=' + encodeURIComponent(domain + req.originalUrl));
 });
 
-app.listen(port, () => { console.log('Proxy Fixed and Running'); });
+app.listen(port, () => { console.log('Final Engine Proxy Running'); });
