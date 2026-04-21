@@ -15,12 +15,19 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // 검색어 파라미터 통합 처리 (구글/네이버/레딧 등)
+  // [수정] 네이버 강제 연결 로직 삭제 -> 현재 페이지 기반 검색 복구
   if (!targetUrl) {
-    const q = req.query.query || req.query.q || req.query.searchTerm;
-    if (q) {
-      // 기본값은 네이버 검색으로 설정 (필요시 변경 가능)
-      targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
+    const referer = req.headers.referer;
+    const q = req.query.query || req.query.q;
+    
+    if (q && referer && referer.includes('url=')) {
+      try {
+        const prevUrl = new URL(new URL(referer).searchParams.get('url'));
+        // 이전 도메인 주소에 검색어만 붙여서 다시 요청
+        targetUrl = prevUrl.origin + prevUrl.pathname + (prevUrl.search ? prevUrl.search + '&' : '?') + (req.query.query ? 'query=' : 'q=') + encodeURIComponent(q);
+      } catch(e) {
+        return res.redirect('/');
+      }
     } else {
       return res.redirect('/');
     }
@@ -28,7 +35,7 @@ app.get('/proxy', async (req, res) => {
 
   try {
     const urlObj = new URL(targetUrl);
-    // 모든 쿼리를 합침
+    // 모든 쿼리 파라미터 유지
     Object.keys(req.query).forEach(key => {
       if (key !== 'url') urlObj.searchParams.set(key, req.query[key]);
     });
@@ -37,8 +44,6 @@ app.get('/proxy', async (req, res) => {
     const response = await axios.get(targetUrl, {
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
         'Referer': urlObj.origin
       },
       responseType: 'arraybuffer',
@@ -46,17 +51,13 @@ app.get('/proxy', async (req, res) => {
       validateStatus: false 
     });
 
-    // 쿠키 전달 (로그인 등 세션 유지에 필요)
-    const setCookie = response.headers['set-cookie'];
-    if (setCookie) res.set('set-cookie', setCookie);
-
     const contentType = response.headers['content-type'] || '';
     res.set('Content-Type', contentType);
 
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 경로 치환
+      // 모든 경로 치환
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -69,59 +70,52 @@ app.get('/proxy', async (req, res) => {
         });
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
-      
-      // 폼 처리
-      $('form').attr('action', '/proxy').attr('method', 'GET');
 
+      // 폼 가로채기 스크립트 (중립 버전)
       const injectScript = `
         <script>
           (function() {
-            const currentOrigin = window.location.origin;
             const wrap = (u) => {
               if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#')) return u;
               try {
                 const abs = new URL(u, window.location.href).href;
-                if (abs.includes(currentOrigin)) return abs;
-                return currentOrigin + '/proxy?url=' + encodeURIComponent(abs);
+                if (abs.includes(window.location.host)) return abs;
+                return window.location.origin + '/proxy?url=' + encodeURIComponent(abs);
               } catch(e) { return u; }
             };
 
-            // 1. 도메인 속이기 (네이버 튕김 방지)
-            try { Object.defineProperty(document, 'domain', { get: () => 'naver.com' }); } catch(e) {}
-
-            // 2. 모든 클릭/이동 가로채기
             window.addEventListener('click', function(e) {
               const a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(currentOrigin)) {
+              if (a && a.href && !a.href.includes(window.location.host)) {
                 e.preventDefault();
                 window.location.href = wrap(a.href);
               }
             }, true);
 
-            // 3. 구글/레딧 등 SPA 사이트용 History API 가로채기
-            const patchHistory = (type) => {
-              const orig = history[type];
-              history[type] = function(state, title, url) {
-                if (url && !url.includes(currentOrigin)) {
-                  window.location.href = wrap(url);
+            window.addEventListener('submit', function(e) {
+              const form = e.target;
+              const action = new URL(form.action || window.location.href, window.location.href).href;
+              if (!action.includes(window.location.host)) {
+                e.preventDefault();
+                const fd = new FormData(form);
+                const sp = new URLSearchParams();
+                for (const [k, v] of fd.entries()) sp.append(k, v);
+                window.location.href = wrap(action.split('?')[0] + '?' + sp.toString());
+              }
+            }, true);
+            
+            // History API 보호
+            const patch = (m) => {
+              const orig = history[m];
+              history[m] = function(s, t, u) {
+                if (u && !u.includes(window.location.host)) {
+                  window.location.href = wrap(u);
                   return;
                 }
                 return orig.apply(this, arguments);
               };
             };
-            patchHistory('pushState');
-            patchHistory('replaceState');
-
-            // 4. 폼 전송 가로채기 (검색 기능)
-            window.addEventListener('submit', function(e) {
-              const form = e.target;
-              if (!form.action.includes(currentOrigin)) {
-                e.preventDefault();
-                const action = new URL(form.action || window.location.href, window.location.href).href;
-                const sp = new URLSearchParams(new FormData(form));
-                window.location.href = wrap(action.split('?')[0] + '?' + sp.toString());
-              }
-            }, true);
+            patch('pushState'); patch('replaceState');
           })();
         </script>
       `;
@@ -135,16 +129,8 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// 이탈 방지 와일드카드
 app.get('*', (req, res) => {
-  const referer = req.headers.referer;
-  if (referer && referer.includes('url=')) {
-    try {
-      const prev = new URL(new URL(referer).searchParams.get('url'));
-      return res.redirect('/proxy?url=' + encodeURIComponent(prev.origin + req.originalUrl));
-    } catch(e) {}
-  }
   res.redirect('/');
 });
 
-app.listen(port, () => { console.log('Proxy Deployment Active'); });
+app.listen(port, () => { console.log('Proxy Fixed'); });
