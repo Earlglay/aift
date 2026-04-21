@@ -15,7 +15,7 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // 범용 검색어 보정
+  // 1. 검색어 자동 보정
   if (!targetUrl && (req.query.query || req.query.q)) {
     const q = req.query.query || req.query.q;
     targetUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(q)}`;
@@ -33,7 +33,9 @@ app.get('/proxy', async (req, res) => {
     const response = await axios.get(targetUrl, {
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': new URL(targetUrl).origin
+        'Referer': 'https://www.naver.com/',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
       },
       responseType: 'arraybuffer',
       timeout: 10000,
@@ -46,7 +48,7 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 1. HTML 태그 경로 치환 (기본)
+      // 모든 경로 리라이팅
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -60,51 +62,54 @@ app.get('/proxy', async (req, res) => {
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      // 2. [초강력] 자바스크립트 엔진 레벨 가로채기
+      // [초강력] JS 보안 우회 스크립트
       const injectScript = `
         <script>
           (function() {
-            const origin = window.location.origin;
+            const PROXY_URL = window.location.origin + '/proxy?url=';
             const wrap = (u) => {
-              if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#') || u.startsWith(origin)) return u;
-              try { return origin + '/proxy?url=' + encodeURIComponent(new URL(u, window.location.href).href); } catch(e) { return u; }
+              if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#')) return u;
+              try {
+                const abs = new URL(u, window.location.href).href;
+                if (abs.includes(window.location.host)) return abs;
+                return PROXY_URL + encodeURIComponent(abs);
+              } catch(e) { return u; }
             };
 
-            // [클릭] 캡처링 단계에서 원천 봉쇄
-            window.addEventListener('click', e => {
+            // 1. 도메인 속이기 (네이버 JS가 도메인을 체크할 때 네이버인 척 함)
+            try {
+              Object.defineProperty(document, 'domain', { get: () => 'naver.com' });
+            } catch(e) {}
+
+            // 2. 모든 클릭/이동 가로채기 (최우선 순위)
+            window.addEventListener('click', function(e) {
               const a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(origin)) {
-                e.preventDefault(); e.stopImmediatePropagation();
-                window.location.href = wrap(a.href);
+              if (a && a.href) {
+                const target = a.href;
+                if (!target.includes(window.location.host)) {
+                  e.preventDefault();
+                  e.stopImmediatePropagation();
+                  window.location.href = wrap(target);
+                }
               }
             }, true);
 
-            // [비동기] Fetch 및 XHR 가로채기 (네이버의 내부 통신 감시)
-            const orgFetch = window.fetch;
-            window.fetch = function(r, i) {
-              if(typeof r === 'string') r = wrap(r);
-              return orgPush.apply(this, arguments);
-            };
+            // 3. 비동기 이동(Location 조작) 감시 및 가로채기
+            const orgPush = history.pushState;
+            const orgReplace = history.replaceState;
+            history.pushState = function(s, t, u) { return u ? (window.location.href = wrap(u)) : orgPush.apply(this, arguments); };
+            history.replaceState = function(s, t, u) { return u ? (window.location.href = wrap(u)) : orgReplace.apply(this, arguments); };
 
-            // [주소창] History API 조작 감시 (튕김 방지 핵심)
-            const patchProp = (obj, prop) => {
-              const org = obj[prop];
-              obj[prop] = function(s, t, u) {
-                if(u) window.location.href = wrap(u);
-                else return org.apply(this, arguments);
-              };
-            };
-            patchProp(history, 'pushState');
-            patchProp(history, 'replaceState');
-
-            // [폼] 전송 가로채기
-            window.addEventListener('submit', e => {
-              const f = e.target;
-              const act = new URL(f.action || window.location.href, window.location.href).href;
-              if(!act.includes(origin)) {
-                e.preventDefault(); e.stopImmediatePropagation();
-                const params = new URLSearchParams(new FormData(f));
-                window.location.href = wrap(act.split('?')[0] + '?' + params.toString());
+            // 4. 폼 전송 가로채기
+            window.addEventListener('submit', function(e) {
+              const form = e.target;
+              const action = new URL(form.action || window.location.href, window.location.href).href;
+              if (!action.includes(window.location.host)) {
+                e.preventDefault();
+                const fd = new FormData(form);
+                const sp = new URLSearchParams();
+                for (const [k, v] of fd.entries()) sp.append(k, v);
+                window.location.href = wrap(action.split('?')[0] + '?' + sp.toString());
               }
             }, true);
           })();
@@ -120,19 +125,15 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// [와일드카드] 길 잃은 요청 자동 복원
 app.get('*', (req, res) => {
-  const path = req.path;
-  if (['/proxy', '/'].includes(path) || path.includes('.')) return;
-
   const referer = req.headers.referer;
-  let domain = 'https://www.naver.com';
   if (referer && referer.includes('url=')) {
     try {
-      domain = new URL(decodeURIComponent(new URL(referer).searchParams.get('url'))).origin;
+      const prevUrl = new URL(new URL(referer).searchParams.get('url'));
+      return res.redirect('/proxy?url=' + encodeURIComponent(prevUrl.origin + req.originalUrl));
     } catch(e) {}
   }
-  res.redirect('/proxy?url=' + encodeURIComponent(domain + req.originalUrl));
+  res.redirect('/');
 });
 
-app.listen(port, () => { console.log('Final Engine Proxy Running'); });
+app.listen(port, () => { console.log('Final Proxy Deployment Active'); });
