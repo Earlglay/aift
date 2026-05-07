@@ -12,15 +12,10 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// [추가] 백그라운드 핑 엔드포인트: 사용자의 현재 위치를 서버에 동기화
-app.get('/proxy/ping', (req, res) => {
-  res.status(204).end();
-});
-
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // 1. 유실된 URL 복구 (Referer 기반 도메인 추론)
+  // [보정] URL 유실 시 이전 Referer 기반으로 도메인 복구
   if (!targetUrl) {
     const q = req.query.query || req.query.q;
     const referer = req.headers.referer;
@@ -43,7 +38,7 @@ app.get('/proxy', async (req, res) => {
         'Referer': urlObj.origin
       },
       responseType: 'arraybuffer',
-      timeout: 12000,
+      timeout: 10000,
       validateStatus: false 
     });
 
@@ -53,7 +48,7 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 2. 서버 측 정적 리소스 치환
+      // 1. 모든 정적 요소 치환
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -67,7 +62,7 @@ app.get('/proxy', async (req, res) => {
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      // 3. [핵심] OneLink 스마트 스크립트 원리를 적용한 클라이언트 로직
+      // 2. [초강력] MutationObserver 기반 실시간 감시 스크립트 주입
       const injectScript = `
         <script>
           (function() {
@@ -81,25 +76,20 @@ app.get('/proxy', async (req, res) => {
               } catch(e) { return u; }
             };
 
-            // 1) 동적 링크 감시 및 치환 (OneLink의 querySelectorAll 로직 응용)
-            const smartRewriter = () => {
-              document.querySelectorAll('a[href], form[action]').forEach(el => {
+            // [업그레이드] MutationObserver: 자바스크립트가 링크를 새로 만들 때마다 즉시 감지하여 수정
+            const observer = new MutationObserver(() => {
+              document.querySelectorAll('a[href]:not([data-proxied]), form[action]:not([data-proxied])').forEach(el => {
                 const attr = el.tagName === 'A' ? 'href' : 'action';
                 const originalValue = el.getAttribute(attr);
-                if (originalValue && !originalValue.includes(currentOrigin) && !originalValue.startsWith('javascript:')) {
+                if (originalValue && !originalValue.includes(currentOrigin)) {
                   el.setAttribute(attr, wrap(originalValue));
+                  el.setAttribute('data-proxied', 'true'); // 중복 처리 방지
                 }
               });
-            };
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
 
-            // 페이지 로드 직후 및 1.5초 뒤(지연 생성 대응) 실행
-            smartRewriter();
-            setTimeout(smartRewriter, 1500); 
-            
-            // 2) 백그라운드 핑 (OneLink의 fetch no-cors 응용)
-            fetch('/proxy/ping?last_pos=' + encodeURIComponent(window.location.href), { mode: 'no-cors' }).catch(() => {});
-
-            // 3) 클릭/전송 최우선 가로채기
+            // 클릭 및 전송 최우선 가로채기 (이벤트 캡처링 단계)
             window.addEventListener('click', function(e) {
               const a = e.target.closest('a');
               if (a && a.href && !a.href.includes(currentOrigin)) {
@@ -111,19 +101,28 @@ app.get('/proxy', async (req, res) => {
 
             window.addEventListener('submit', function(e) {
               const form = e.target;
-              const action = new URL(form.action || window.location.href, window.location.href).href;
-              if (!action.includes(currentOrigin)) {
+              if (!form.action.includes(currentOrigin)) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 const fd = new FormData(form);
                 const sp = new URLSearchParams();
                 for (const [k, v] of fd.entries()) sp.append(k, v);
-                window.location.href = wrap(action.split('?')[0] + '?' + sp.toString());
+                window.location.href = wrap(form.action.split('?')[0] + '?' + sp.toString());
               }
             }, true);
 
-            // 4) 네이버 등 보안 도메인 속이기
-            try { Object.defineProperty(document, 'domain', { get: () => 'naver.com' }); } catch(e) {}
+            // History API 조작 감시 (주소창 초기화 방지)
+            const patch = (type) => {
+              const orig = history[type];
+              history[type] = function(s, t, u) {
+                if (u && !u.includes(currentOrigin)) {
+                  window.location.href = wrap(u);
+                  return;
+                }
+                return orig.apply(this, arguments);
+              };
+            };
+            patch('pushState'); patch('replaceState');
           })();
         </script>
       `;
@@ -137,16 +136,7 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// 4. 경로 이탈 시 자동 복구 와일드카드
-app.get('*', (req, res) => {
-  const referer = req.headers.referer;
-  if (referer && referer.includes('url=')) {
-    try {
-      const prev = new URL(new URL(referer).searchParams.get('url'));
-      return res.redirect('/proxy?url=' + encodeURIComponent(prev.origin + req.originalUrl));
-    } catch(e) {}
-  }
-  res.redirect('/');
-});
+// 모든 예외 경로 홈 리다이렉트 (이걸 유지해야 서버가 안 죽음)
+app.get('*', (req, res) => { res.redirect('/'); });
 
-app.listen(port, () => { console.log('Smart Proxy Server Active'); });
+app.listen(port, () => { console.log('Fixed Proxy Running'); });
