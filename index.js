@@ -15,14 +15,18 @@ app.get('/', (req, res) => {
 app.get('/proxy', async (req, res) => {
   let targetUrl = req.query.url;
 
-  // [보정] URL 유실 시 이전 Referer 기반으로 도메인 복구
+  // 1. 유실된 검색 요청 복구 (이전 페이지 도메인을 기억해서 연결)
   if (!targetUrl) {
-    const q = req.query.query || req.query.q;
+    const q = req.query.query || req.query.q || req.query.searchTerm;
     const referer = req.headers.referer;
     if (q && referer && referer.includes('url=')) {
       try {
         const prevUrl = new URL(new URL(referer).searchParams.get('url'));
-        targetUrl = prevUrl.origin + prevUrl.pathname + (prevUrl.search ? prevUrl.search + '&' : '?') + (req.query.query ? 'query=' : 'q=') + encodeURIComponent(q);
+        // 이전 도메인에 맞춰 검색 경로 자동 생성
+        const searchPath = prevUrl.origin.includes('google') ? '/search?q=' : 
+                           prevUrl.origin.includes('naver') ? '/search.naver?query=' : 
+                           prevUrl.pathname + '?q=';
+        targetUrl = prevUrl.origin + searchPath + encodeURIComponent(q);
       } catch(e) { return res.redirect('/'); }
     } else { return res.redirect('/'); }
   }
@@ -35,10 +39,11 @@ app.get('/proxy', async (req, res) => {
     const response = await axios.get(targetUrl, {
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': urlObj.origin
+        'Referer': urlObj.origin,
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7'
       },
       responseType: 'arraybuffer',
-      timeout: 10000,
+      timeout: 12000,
       validateStatus: false 
     });
 
@@ -48,7 +53,7 @@ app.get('/proxy', async (req, res) => {
     if (contentType.includes('text/html')) {
       const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 1. 모든 정적 요소 치환
+      // 2. 정적 리소스 주소 모두 치환
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -62,67 +67,65 @@ app.get('/proxy', async (req, res) => {
       };
       rewrite('img', 'src'); rewrite('link', 'href'); rewrite('script', 'src'); rewrite('a', 'href');
 
-      // 2. [초강력] MutationObserver 기반 실시간 감시 스크립트 주입
+      // 3. [최후의 수단] 브라우저 내 이동 명령 전체 가로채기
       const injectScript = `
         <script>
           (function() {
-            const currentOrigin = window.location.origin;
+            const PROXY_BASE = window.location.origin + '/proxy?url=';
             const wrap = (u) => {
               if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#')) return u;
               try {
                 const abs = new URL(u, window.location.href).href;
-                if (abs.includes(currentOrigin)) return abs;
-                return currentOrigin + '/proxy?url=' + encodeURIComponent(abs);
+                if (abs.includes(window.location.host)) return abs;
+                return PROXY_BASE + encodeURIComponent(abs);
               } catch(e) { return u; }
             };
 
-            // [업그레이드] MutationObserver: 자바스크립트가 링크를 새로 만들 때마다 즉시 감지하여 수정
-            const observer = new MutationObserver(() => {
-              document.querySelectorAll('a[href]:not([data-proxied]), form[action]:not([data-proxied])').forEach(el => {
-                const attr = el.tagName === 'A' ? 'href' : 'action';
-                const originalValue = el.getAttribute(attr);
-                if (originalValue && !originalValue.includes(currentOrigin)) {
-                  el.setAttribute(attr, wrap(originalValue));
-                  el.setAttribute('data-proxied', 'true'); // 중복 처리 방지
-                }
-              });
-            });
-            observer.observe(document.body, { childList: true, subtree: true });
-
-            // 클릭 및 전송 최우선 가로채기 (이벤트 캡처링 단계)
+            // 모든 클릭 가로채기
             window.addEventListener('click', function(e) {
               const a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(currentOrigin)) {
+              if (a && a.href && !a.href.includes(window.location.host)) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
                 window.location.href = wrap(a.href);
               }
             }, true);
 
+            // 모든 폼 전송 가로채기
             window.addEventListener('submit', function(e) {
               const form = e.target;
-              if (!form.action.includes(currentOrigin)) {
+              const action = new URL(form.action || window.location.href, window.location.href).href;
+              if (!action.includes(window.location.host)) {
                 e.preventDefault();
                 e.stopImmediatePropagation();
-                const fd = new FormData(form);
-                const sp = new URLSearchParams();
-                for (const [k, v] of fd.entries()) sp.append(k, v);
-                window.location.href = wrap(form.action.split('?')[0] + '?' + sp.toString());
+                const params = new URLSearchParams(new FormData(form));
+                window.location.href = wrap(action.split('?')[0] + '?' + params.toString());
               }
             }, true);
 
-            // History API 조작 감시 (주소창 초기화 방지)
-            const patch = (type) => {
-              const orig = history[type];
-              history[type] = function(s, t, u) {
-                if (u && !u.includes(currentOrigin)) {
-                  window.location.href = wrap(u);
+            // [핵심] 주소창 조작 시도 감지 시 즉시 프록시로 재진입
+            const patch = (method) => {
+              const original = history[method];
+              history[method] = function(state, title, url) {
+                if (url && !url.includes(window.location.host)) {
+                  window.location.href = wrap(url);
                   return;
                 }
-                return orig.apply(this, arguments);
+                return original.apply(this, arguments);
               };
             };
-            patch('pushState'); patch('replaceState');
+            patch('pushState');
+            patch('replaceState');
+
+            // 페이지 내에서 발생하는 비정상적인 도메인 이탈 실시간 감시
+            setInterval(() => {
+              document.querySelectorAll('a[href]:not([data-fixed])').forEach(el => {
+                if(!el.href.includes(window.location.host)) {
+                  el.href = wrap(el.href);
+                  el.setAttribute('data-fixed', 'true');
+                }
+              });
+            }, 1000);
           })();
         </script>
       `;
@@ -136,7 +139,16 @@ app.get('/proxy', async (req, res) => {
   }
 });
 
-// 모든 예외 경로 홈 리다이렉트 (이걸 유지해야 서버가 안 죽음)
-app.get('*', (req, res) => { res.redirect('/'); });
+// 4. 경로 이탈 복구 (Referer 기반 지능형 리다이렉트)
+app.get('*', (req, res) => {
+  const referer = req.headers.referer;
+  if (referer && referer.includes('url=')) {
+    try {
+      const prev = new URL(new URL(referer).searchParams.get('url'));
+      return res.redirect('/proxy?url=' + encodeURIComponent(prev.origin + req.originalUrl));
+    } catch(e) {}
+  }
+  res.redirect('/');
+});
 
-app.listen(port, () => { console.log('Fixed Proxy Running'); });
+app.listen(port, () => { console.log('Universal Proxy Shield Active'); });
