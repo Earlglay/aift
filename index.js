@@ -18,21 +18,17 @@ app.get('/proxy', async (req, res) => {
 
   try {
     const urlObj = new URL(targetUrl);
-    
-    // [개선] 사이트 차단을 막기 위한 헤더 최소화 및 표준화
     const response = await axios.get(targetUrl, {
       headers: { 
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Referer': urlObj.origin, // 접속 불가 방지를 위해 도메인 일치시킴
-        'Connection': 'keep-alive'
+        'Referer': urlObj.origin,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
       },
       responseType: 'arraybuffer',
-      timeout: 15000,
+      timeout: 10000,
       validateStatus: false 
     });
 
-    // 보안 정책 삭제 (브라우저 차단 해제)
     res.removeHeader('content-security-policy');
     res.removeHeader('x-frame-options');
 
@@ -40,10 +36,8 @@ app.get('/proxy', async (req, res) => {
     res.set('Content-Type', contentType);
 
     if (contentType.includes('text/html')) {
-      const html = response.data.toString('utf-8');
-      const $ = cheerio.load(html);
+      const $ = cheerio.load(response.data.toString('utf-8'));
 
-      // 모든 링크를 절대 경로로 바꾼 후 프록시 주소로 감쌈
       const rewrite = (tag, attr) => {
         $(tag).each((i, el) => {
           const val = $(el).attr(attr);
@@ -57,43 +51,62 @@ app.get('/proxy', async (req, res) => {
       };
       rewrite('a', 'href'); rewrite('form', 'action'); rewrite('img', 'src'); rewrite('script', 'src'); rewrite('link', 'href');
 
-      // [핵심] 튕김 방지 스크립트 (최소화된 안정 버전)
+      // [핵심] 검색 튕김 방지 및 History API 원천 봉쇄 스크립트
       const injectScript = `
         <script>
           (function() {
             const PROXY_URL = window.location.origin + '/proxy?url=';
-            
-            // 1. 모든 클릭 가로채기 (강제 리다이렉트 방지)
-            window.addEventListener('click', e => {
-              const a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(window.location.host)) {
-                e.preventDefault();
-                window.location.href = PROXY_URL + encodeURIComponent(a.href);
-              }
-            }, true);
+            const wrap = (u) => {
+              if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#')) return u;
+              try {
+                const abs = new URL(u, window.location.href).href;
+                if (abs.includes(window.location.host)) return abs;
+                return PROXY_URL + encodeURIComponent(abs);
+              } catch(e) { return u; }
+            };
 
-            // 2. 폼 전송 (검색) 가로채기
-            window.addEventListener('submit', e => {
+            // 1. History API 무력화 (검색 시 주소창이 원본으로 바뀌는 것 차단)
+            const patchHistory = (method) => {
+              const original = history[method];
+              history[method] = function(state, title, url) {
+                if (url && !url.includes(window.location.host)) {
+                  // 주소 변경 시도를 가로채서 프록시 주소로 강제 리다이렉트
+                  window.location.href = wrap(url);
+                  return;
+                }
+                return original.apply(this, arguments);
+              };
+            };
+            patchHistory('pushState');
+            patchHistory('replaceState');
+
+            // 2. 검색 버튼 및 폼 전송 가로채기 (이벤트 캡처링 단계)
+            window.addEventListener('submit', function(e) {
               const form = e.target;
               const action = new URL(form.action || window.location.href, window.location.href).href;
+              
               if (!action.includes(window.location.host)) {
                 e.preventDefault();
+                e.stopImmediatePropagation();
+                
                 const fd = new FormData(form);
                 const sp = new URLSearchParams();
                 for (const [k, v] of fd.entries()) sp.append(k, v);
-                window.location.href = PROXY_URL + encodeURIComponent(action.split('?')[0] + '?' + sp.toString());
+                
+                const finalSearchUrl = action.split('?')[0] + '?' + sp.toString();
+                window.location.href = wrap(finalSearchUrl);
               }
             }, true);
 
-            // 3. OneLink 방식의 지연 실행: JS로 나중에 생성된 링크 보호
+            // 3. 지연 로딩되는 검색 결과 링크들 보호 (OneLink 스타일)
             setInterval(() => {
               document.querySelectorAll('a[href]:not([data-proxy])').forEach(el => {
                 if(!el.href.includes(window.location.host)) {
                   el.setAttribute('data-proxy', 'true');
-                  el.href = PROXY_URL + encodeURIComponent(el.href);
+                  el.href = wrap(el.href);
                 }
               });
-            }, 2000);
+            }, 1000);
           })();
         </script>
       `;
@@ -102,13 +115,14 @@ app.get('/proxy', async (req, res) => {
     }
     res.send(response.data);
   } catch (error) {
-    console.error("Proxy Error:", error.message);
     res.redirect('/');
   }
 });
 
-// [중요] 무한 튕김의 원인이었던 '*' 와일드카드 제거
-// 대신 public 폴더의 정적 파일만 처리
-app.use((req, res) => res.status(404).redirect('/'));
+// 정적 파일 외의 모든 요청은 404 처리하여 튕김 루프 방지
+app.use((req, res, next) => {
+  if (req.path === '/' || req.path === '/proxy') return next();
+  res.status(404).send('Not Found');
+});
 
-app.listen(port, () => { console.log('Stable Proxy Active'); });
+app.listen(port, () => { console.log('Search-Fix Proxy Active'); });
