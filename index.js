@@ -1,104 +1,107 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const axios = require('axios');
+const cheerio = require('cheerio');
 const path = require('path');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// 정적 파일 제공 (public 폴더 내의 index.html 등)
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// 전역 브라우저 인스턴스 (요청마다 브라우저를 새로 켜면 Render 서버가 바로 터집니다)
-let browserInstance = null;
-
-async function getBrowser() {
-  if (!browserInstance) {
-    browserInstance = await puppeteer.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', // 공유 메모리 부족으로 인한 크래시 방지
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process', // Render의 부족한 메모리(512MB)를 아끼기 위해 단일 프로세스로 실행
-        '--disable-gpu'
-      ]
-    });
-  }
-  return browserInstance;
-}
-
 app.get('/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.redirect('/');
 
-  let page = null;
   try {
-    const browser = await getBrowser();
-    page = await browser.newPage();
-
-    // [핵심] Render 메모리 절약을 위해 이미지, 스타일시트, 폰트, 미디어 로딩 전면 차단
-    await page.setRequestInterception(true);
-    page.on('request', (request) => {
-      const resourceType = request.resourceType();
-      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
-        request.abort();
-      } else {
-        request.continue();
-      }
-    });
-
-    // 실제 브라우저처럼 보이도록 User-Agent 설정
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-
-    // 자바스크립트 기본 실행 직후(DOM 로드 완료) 바로 소스코드를 낚아챔 (속도 최적화)
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-
-    // Puppeteer 크롬이 자바스크립트를 해석해서 만들어낸 최종 HTML 결과물 백업
-    let content = await page.content();
-
-    // HTML 내부의 모든 링크(href, src, action)를 우리 프록시 주소로 강제 치환
-    const myOrigin = `${req.protocol}://${req.get('host')}`;
-    
-    content = content.replace(/(href|src|action)=["']((?!javascript:|data:|#)[^"']+)["']/g, (match, attr, url) => {
-      try {
-        // 상대 경로를 타겟 URL 기준으로 절대 경로 변환
-        const absoluteUrl = new URL(url, targetUrl).href;
-        // 우리 프록시 주소를 앞에 붙여서 리턴
-        return `${attr}="${myOrigin}/proxy?url=${encodeURIComponent(absoluteUrl)}"`;
-      } catch (e) {
-        return match;
-      }
-    });
-
-    // 자바스크립트 내부의 상대 경로 기준점 고정을 위한 <base> 태그 주입
     const urlObj = new URL(targetUrl);
-    content = content.replace('<head>', `<head><base href="${urlObj.origin}/">`);
+    
+    // 1. 진짜 브라우저처럼 정중하게 요청 (차단 회피)
+    const response = await axios.get(targetUrl, {
+      headers: { 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8',
+        'Referer': urlObj.origin
+      },
+      responseType: 'arraybuffer',
+      timeout: 8000, // 타임아웃 방지를 위해 8초 제한
+      validateStatus: false 
+    });
 
-    // 클라이언트에 HTML 전송
-    res.set('Content-Type', 'text/html; charset=utf-8');
-    return res.send(content);
+    // 보안 헤더 무력화
+    res.removeHeader('content-security-policy');
+    res.removeHeader('x-frame-options');
+
+    const contentType = response.headers['content-type'] || '';
+    res.set('Content-Type', contentType);
+
+    if (contentType.includes('text/html')) {
+      const $ = cheerio.load(response.data.toString('utf-8'));
+
+      // [🚨 핵심] 구글/네이버의 튕김 스크립트 원천 제거
+      // 사이트 자체 JS가 실행되지 않게 만들어서 주소창 조작(튕김)을 물리적으로 불가능하게 만듭니다.
+      $('script').remove(); 
+
+      // 2. 모든 정적 링크 치환
+      const myOrigin = `${req.protocol}://${req.get('host')}`;
+      const rewrite = (tag, attr) => {
+        $(tag).each((i, el) => {
+          const val = $(el).attr(attr);
+          if (val && !val.startsWith('data:') && !val.startsWith('javascript:') && !val.startsWith('#')) {
+            try {
+              const abs = new URL(val, targetUrl).href;
+              $(el).attr(attr, `${myOrigin}/proxy?url=${encodeURIComponent(abs)}`);
+            } catch (e) {}
+          }
+        });
+      };
+      rewrite('a', 'href'); rewrite('form', 'action'); rewrite('img', 'src'); rewrite('link', 'href');
+
+      // 3. [대체 스크립트] 원본 JS 대신 우리가 만든 '검색 전용 가로채기 스크립트' 딱 하나만 주입
+      const injectScript = `
+        <script>
+          (function() {
+            const PROXY_URL = window.location.origin + '/proxy?url=';
+            
+            // 검색(Form 전송) 버튼 누를 때 튕기지 않고 우리 프록시로 유도
+            window.addEventListener('submit', function(e) {
+              const form = e.target;
+              const action = new URL(form.action || window.location.href, window.location.href).href;
+              
+              if (!action.includes(window.location.host)) {
+                e.preventDefault();
+                
+                // 검색어 파라미터 추출
+                const fd = new FormData(form);
+                const sp = new URLSearchParams();
+                for (const [k, v] of fd.entries()) sp.append(k, v);
+                
+                const finalUrl = action.split('?')[0] + '?' + sp.toString();
+                window.location.href = PROXY_URL + encodeURIComponent(finalUrl);
+              }
+            }, true);
+          })();
+        </script>
+      `;
+      $('head').prepend(injectScript);
+      
+      return res.send($.html());
+    }
+    
+    // HTML이 아닌 이미지 등의 리소스는 그대로 중계
+    return res.send(response.data);
 
   } catch (error) {
-    console.error("Puppeteer Proxy Error:", error.message);
-    return res.status(500).send("페이지를 로드하는 중 오류가 발생했습니다. (Render 메모리 초과 또는 타임아웃)");
-  } finally {
-    // 메모리 누수를 막기 위해 사용한 탭(페이지)은 반드시 닫음
-    if (page) await page.close();
+    console.error("Proxy Error:", error.message);
+    return res.redirect('/');
   }
 });
 
-// 정적 파일 및 프록시 외의 비정상 경로는 메인으로 안전하게 리다이렉트 (튕김 루프 방지)
-app.use((req, res) => {
-  res.redirect('/');
-});
+// 안전장치: 이상한 경로로 빠지면 무조건 메인으로
+app.use((req, res) => res.redirect('/'));
 
-app.listen(port, () => {
-  console.log(`Puppeteer Light Proxy Server is running on port ${port}`);
-});
+app.listen(port, () => { console.log('Ultra-Light Safe Proxy Active'); });
