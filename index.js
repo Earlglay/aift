@@ -1,136 +1,104 @@
 const express = require('express');
-const axios = require('axios');
-const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
 const path = require('path');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+// 정적 파일 제공 (public 폴더 내의 index.html 등)
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// 전역 브라우저 인스턴스 (요청마다 브라우저를 새로 켜면 Render 서버가 바로 터집니다)
+let browserInstance = null;
+
+async function getBrowser() {
+  if (!browserInstance) {
+    browserInstance = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', // 공유 메모리 부족으로 인한 크래시 방지
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process', // Render의 부족한 메모리(512MB)를 아끼기 위해 단일 프로세스로 실행
+        '--disable-gpu'
+      ]
+    });
+  }
+  return browserInstance;
+}
+
 app.get('/proxy', async (req, res) => {
   const targetUrl = req.query.url;
   if (!targetUrl) return res.redirect('/');
 
+  let page = null;
   try {
-    const urlObj = new URL(targetUrl);
-    
-    // [중요] 네이버 접속 불가는 대부분 '쿠키'와 'Referer' 유실 문제임
-    const response = await axios.get(targetUrl, {
-      headers: { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Referer': urlObj.origin,
-        'Cookie': req.headers.cookie || '', // 브라우저의 쿠키를 대상 사이트로 전달
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-      },
-      responseType: 'arraybuffer',
-      timeout: 10000,
-      validateStatus: false 
+    const browser = await getBrowser();
+    page = await browser.newPage();
+
+    // [핵심] Render 메모리 절약을 위해 이미지, 스타일시트, 폰트, 미디어 로딩 전면 차단
+    await page.setRequestInterception(true);
+    page.on('request', (request) => {
+      const resourceType = request.resourceType();
+      if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+        request.abort();
+      } else {
+        request.continue();
+      }
     });
 
-    // 대상 사이트가 주는 쿠키를 우리 브라우저에 저장 (세션 유지)
-    if (response.headers['set-cookie']) {
-      res.set('set-cookie', response.headers['set-cookie']);
-    }
+    // 실제 브라우저처럼 보이도록 User-Agent 설정
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
 
-    res.removeHeader('content-security-policy');
-    res.removeHeader('x-frame-options');
+    // 자바스크립트 기본 실행 직후(DOM 로드 완료) 바로 소스코드를 낚아챔 (속도 최적화)
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
-    const contentType = response.headers['content-type'] || '';
-    res.set('Content-Type', contentType);
+    // Puppeteer 크롬이 자바스크립트를 해석해서 만들어낸 최종 HTML 결과물 백업
+    let content = await page.content();
 
-    if (contentType.includes('text/html')) {
-      const $ = cheerio.load(response.data.toString('utf-8'));
+    // HTML 내부의 모든 링크(href, src, action)를 우리 프록시 주소로 강제 치환
+    const myOrigin = `${req.protocol}://${req.get('host')}`;
+    
+    content = content.replace(/(href|src|action)=["']((?!javascript:|data:|#)[^"']+)["']/g, (match, attr, url) => {
+      try {
+        // 상대 경로를 타겟 URL 기준으로 절대 경로 변환
+        const absoluteUrl = new URL(url, targetUrl).href;
+        // 우리 프록시 주소를 앞에 붙여서 리턴
+        return `${attr}="${myOrigin}/proxy?url=${encodeURIComponent(absoluteUrl)}"`;
+      } catch (e) {
+        return match;
+      }
+    });
 
-      const rewrite = (tag, attr) => {
-        $(tag).each((i, el) => {
-          const val = $(el).attr(attr);
-          if (val && !val.startsWith('data:') && !val.startsWith('javascript:')) {
-            try {
-              const abs = new URL(val, targetUrl).href;
-              $(el).attr(attr, '/proxy?url=' + encodeURIComponent(abs));
-            } catch (e) {}
-          }
-        });
-      };
-      rewrite('a', 'href'); rewrite('form', 'action'); rewrite('img', 'src'); rewrite('script', 'src'); rewrite('link', 'href');
+    // 자바스크립트 내부의 상대 경로 기준점 고정을 위한 <base> 태그 주입
+    const urlObj = new URL(targetUrl);
+    content = content.replace('<head>', `<head><base href="${urlObj.origin}/">`);
 
-      // [구글 무한 새로고침 저격] 브라우저 이동 관련 API 강제 고정
-      const injectScript = `
-        <script>
-          (function() {
-            const PROXY_URL = window.location.origin + '/proxy?url=';
-            
-            // 1. 구글이 주소창을 멋대로 바꾸지 못하게 History API 동결
-            const freeze = (obj, prop, value) => {
-              Object.defineProperty(obj, prop, { configurable: false, writable: false, value: value });
-            };
+    // 클라이언트에 HTML 전송
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    return res.send(content);
 
-            const wrap = (u) => {
-              if(!u || typeof u !== 'string' || u.startsWith('javascript:') || u.startsWith('#')) return u;
-              try {
-                const abs = new URL(u, window.location.href).href;
-                if (abs.includes(window.location.host)) return abs;
-                return PROXY_URL + encodeURIComponent(abs);
-              } catch(e) { return u; }
-            };
-
-            // pushState, replaceState 가로채서 프록시 유지
-            const patch = (m) => {
-              const org = history[m];
-              history[m] = function(s, t, u) {
-                if (u && !u.includes(window.location.host)) {
-                  window.location.href = wrap(u);
-                } else {
-                  return org.apply(this, arguments);
-                }
-              };
-            };
-            patch('pushState'); patch('replaceState');
-
-            // 2. 폼 전송/클릭 가로채기 (최우선순위)
-            window.addEventListener('submit', e => {
-              const form = e.target;
-              if (!form.action.includes(window.location.host)) {
-                e.preventDefault();
-                e.stopImmediatePropagation();
-                const fd = new FormData(form);
-                const sp = new URLSearchParams();
-                for (const [k, v] of fd.entries()) sp.append(k, v);
-                window.location.href = wrap(form.action.split('?')[0] + '?' + sp.toString());
-              }
-            }, true);
-
-            window.addEventListener('click', e => {
-              const a = e.target.closest('a');
-              if (a && a.href && !a.href.includes(window.location.host)) {
-                e.preventDefault();
-                e.stopImmediatePropagation();
-                window.location.href = wrap(a.href);
-              }
-            }, true);
-
-            // 3. 도메인 속이기 (네이버 차단 방지)
-            try { Object.defineProperty(document, 'domain', { get: () => 'naver.com' }); } catch(e) {}
-          })();
-        </script>
-      `;
-      $('head').prepend(injectScript);
-      return res.send($.html());
-    }
-    res.send(response.data);
   } catch (error) {
-    res.redirect('/');
+    console.error("Puppeteer Proxy Error:", error.message);
+    return res.status(500).send("페이지를 로드하는 중 오류가 발생했습니다. (Render 메모리 초과 또는 타임아웃)");
+  } finally {
+    // 메모리 누수를 막기 위해 사용한 탭(페이지)은 반드시 닫음
+    if (page) await page.close();
   }
 });
 
+// 정적 파일 및 프록시 외의 비정상 경로는 메인으로 안전하게 리다이렉트 (튕김 루프 방지)
 app.use((req, res) => {
-  if (req.path === '/' || req.path === '/proxy') return;
-  res.status(404).redirect('/');
+  res.redirect('/');
 });
 
-app.listen(port, () => { console.log('Final Fix Proxy Active'); });
+app.listen(port, () => {
+  console.log(`Puppeteer Light Proxy Server is running on port ${port}`);
+});
